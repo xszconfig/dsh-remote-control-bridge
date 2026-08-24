@@ -1,0 +1,7 @@
+# dsh-remote-control-bridge bundle patch: mounts the remote-control bridge into
+# the host composition of a dsh profile. It injects `webServer`/`sessions`/
+# `agents` (all provided by dsh-base + dsh-web-app) and exposes the WS + REST
+# remote-control surface on the existing web server.
+- insert:
+    - id: dsh-remote-control-bridge
+      name: dsh-remote-control-bridge
