@@ -195,6 +195,11 @@ export interface EvSessionTitle {
     sessionId: string;
     title: string;
 }
+/** 会话列表增量：新建/下线的会话行（含冷会话首次可见时由 hello 全量对账）。 */
+export interface EvSessionUpsert {
+    type: 'session_upsert';
+    session: SessionSummary;
+}
 export interface EvError {
     type: 'error';
     code: string;
@@ -218,7 +223,7 @@ export interface EvDeviceRevoked {
     type: 'device_revoked';
     deviceId: string;
 }
-export type ServerEvent = EvHello | EvSessions | EvAgents | EvEvent | EvHistory | EvSessionTitle | EvAgentStatus | EvApprovalRequest | EvApprovalResolved | EvQuestionRequest | EvQuestionResolved | EvError | EvDeviceRegistered | EvDeviceRevoked;
+export type ServerEvent = EvHello | EvSessions | EvAgents | EvEvent | EvHistory | EvSessionTitle | EvSessionUpsert | EvAgentStatus | EvApprovalRequest | EvApprovalResolved | EvQuestionRequest | EvQuestionResolved | EvError | EvDeviceRegistered | EvDeviceRevoked;
 export interface PingInfo {
     ok: true;
     version: string;
@@ -247,4 +252,4 @@ export interface DeviceRecord {
     createdAt: number;
     lastSeenAt: number;
 }
-export declare const BRIDGE_VERSION = "0.5.0";
+export declare const BRIDGE_VERSION = "0.6.0";

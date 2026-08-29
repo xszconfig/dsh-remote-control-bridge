@@ -229,6 +229,11 @@ export interface EvSessionTitle {
   sessionId: string
   title: string
 }
+/** 会话列表增量：新建/下线的会话行（含冷会话首次可见时由 hello 全量对账）。 */
+export interface EvSessionUpsert {
+  type: 'session_upsert'
+  session: SessionSummary
+}
 export interface EvError {
   type: 'error'
   code: string
@@ -260,6 +265,7 @@ export type ServerEvent =
   | EvEvent
   | EvHistory
   | EvSessionTitle
+  | EvSessionUpsert
   | EvAgentStatus
   | EvApprovalRequest
   | EvApprovalResolved
@@ -303,4 +309,4 @@ export interface DeviceRecord {
   lastSeenAt: number
 }
 
-export const BRIDGE_VERSION = '0.5.0'
+export const BRIDGE_VERSION = '0.6.0'
