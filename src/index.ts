@@ -28,11 +28,15 @@ import {
   type SessionSummary,
   type WorkspaceSummary,
 } from './protocol.js'
+import { ConnLogger } from './logger.js'
 
 export const name = 'dsh-remote-control-bridge'
 export const inject = ['webServer', 'sessions', 'agents', 'workspaceRegistry', 'sessionTitle']
 
 const PAIR_TTL_MS = 10 * 60_000
+
+/** 连接层结构化日志（基础组件；/remote/logs 可查）。 */
+const logger = new ConnLogger('dsh-remote-control-bridge')
 
 // ---- persisted per-machine fingerprint + paired devices (under $DSH_HOME) ----
 
@@ -288,15 +292,18 @@ export function apply(ctx: Context) {
 
   ctx.on('approval/request', async (req, next) => {
     if (req.signal?.aborted === true) {
+      logger.info('APPROVAL', `请求已中止，直接 cancelled (tool=${req.toolName})`)
       return 'cancelled'
     }
     // 没有已连接手机：不认领，直接放行给桌面端 answerer。
     if (clients.size === 0) {
+      logger.info('APPROVAL', `无手机在线，放行给桌面端 (tool=${req.toolName})`)
       return next()
     }
 
     const approvalId = approvalIdOf(req)
     if (approvalId === undefined) {
+      logger.warn('APPROVAL', `日志关联 approvalId 失败，放行给桌面端 (tool=${req.toolName})`)
       return next()
     }
 
@@ -310,6 +317,7 @@ export function apply(ctx: Context) {
       requestedAt: Date.now(),
     }
 
+    logger.info('APPROVAL', `认领审批 approval=${approvalId.slice(0, 8)} tool=${req.toolName} session=${approval.sessionId.slice(0, 12)}，广播给 ${clients.size} 个客户端`)
 
     return await new Promise<'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'>((resolve) => {
       let settled = false
@@ -320,11 +328,13 @@ export function apply(ctx: Context) {
         clearTimeout(entry?.timer)
         pendingApprovals.delete(approvalId)
         req.signal?.removeEventListener('abort', onAbort)
+        logger.info('APPROVAL', `审批裁决 approval=${approvalId.slice(0, 8)} outcome=${outcome}`)
         broadcast({ type: 'approval_resolved', approvalId, sessionId: approval.sessionId, outcome })
         resolve(outcome)
       }
       const onAbort = () => settle('cancelled')
       const timer = setTimeout(() => {
+        logger.warn('APPROVAL', `审批超时兜底 approval=${approvalId.slice(0, 8)}（${approvalHoldTimeoutMs}ms 无裁决）→ unavailable`)
         settle('unavailable')
       }, approvalHoldTimeoutMs)
       pendingApprovals.set(approvalId, { ...approval, resolve: settle, timer })
@@ -353,14 +363,18 @@ export function apply(ctx: Context) {
         signal: AbortSignal.timeout(5000),
       })
       if (!res.ok) {
+        logger.warn('RESPOND', `POST /api/respond HTTP ${res.status} (rpc=${rpcId.slice(0, 8)})`)
         return false
       }
       const receipt = (await res.json()) as { accepted?: boolean; reason?: string }
       if (receipt.accepted !== true) {
+        logger.warn('RESPOND', `/api/respond 拒绝: ${receipt.reason ?? 'unknown'} (rpc=${rpcId.slice(0, 8)})`)
       } else {
+        logger.info('RESPOND', `/api/respond 已接受 (rpc=${rpcId.slice(0, 8)})`)
       }
       return receipt.accepted === true
     } catch (e) {
+      logger.error('RESPOND', `POST /api/respond 异常: ${e instanceof Error ? e.message : String(e)}`)
       return false
     }
   }
@@ -386,6 +400,7 @@ export function apply(ctx: Context) {
           rpcId,
         }
         muxRemoteApprovals.set(f.approvalId, wire)
+        logger.info('MUX', `转发桌面审批 approval=${f.approvalId.slice(0, 8)} tool=${f.toolName} → 手机`)
         broadcast({ type: 'approval_request', approval: wire })
         break
       }
@@ -409,6 +424,7 @@ export function apply(ctx: Context) {
           requestedAt: Date.now(),
         }
         muxQuestions.set(rpcId, wire)
+        logger.info('MUX', `转发桌面提问 rpc=${rpcId.slice(0, 8)} questions=${f.questions.length} → 手机`)
         broadcast({ type: 'question_request', question: wire })
         break
       }
@@ -435,6 +451,9 @@ export function apply(ctx: Context) {
   /** 维护与 /api/events.mux 的 WebSocket 长连接（只读下链，断开自动重连）。 */
   const runMuxClient = async (): Promise<void> => {
     let failures = 0
+    // 帧类型计数（节流日志用）
+    const frameCounts = new Map<string, number>()
+    let lastFlush = 0
     while (!muxStopped) {
       await new Promise<void>((resolve) => {
         const ws = new WebSocket(`ws://127.0.0.1:${ctx.webServer.port}/api/events.mux`)
@@ -447,18 +466,30 @@ export function apply(ctx: Context) {
         }
         ws.on('open', () => {
           failures = 0
+          logger.info('MUX', `已连接桌面端 mux 下链 (${ctx.webServer.port}/api/events.mux)`)
         })
         ws.on('message', (data) => {
           try {
             const parsed = JSON.parse(data.toString()) as { rpcId?: string; payload?: { type?: string } & Record<string, unknown> }
+            const type = parsed.payload?.type ?? 'unknown'
+            frameCounts.set(type, (frameCounts.get(type) ?? 0) + 1)
+            const now = Date.now()
+            if (now - lastFlush > 5000) {
+              const summary = [...frameCounts.entries()].map(([t, n]) => `${t}=${n}`).join(' ')
+              logger.debug('MUX', `帧统计: ${summary}`)
+              frameCounts.clear()
+              lastFlush = now
+            }
             handleMuxFrame(parsed)
           } catch {
             // 单帧损坏不致命，跳过
+            logger.debug('MUX', '忽略无法解析的 mux 帧')
           }
         })
         ws.on('close', settle)
         ws.on('error', (e) => {
           failures += 1
+          logger.warn('MUX', `mux 连接断开: ${e.message}（第 ${failures} 次，${Math.min(1000 * 2 ** Math.min(failures, 5), 30_000)}ms 后重连）`)
           settle()
         })
       })
@@ -512,6 +543,7 @@ export function apply(ctx: Context) {
     try {
       cmd = JSON.parse(raw.toString()) as ClientCommand
     } catch {
+      logger.warn('CMD', '收到无法解析的 JSON 命令')
       send(ws, { type: 'error', code: 'bad_json', message: 'invalid JSON' })
       return
     }
@@ -526,6 +558,7 @@ export function apply(ctx: Context) {
         ? `rpc=${(cmd as { rpcId: string }).rpcId.slice(0, 8)}`
         : '',
     ].filter(Boolean).join(' ')
+    logger.debug('CMD', `收到命令 type=${cmd.type} ${extra}`)
 
     switch (cmd.type) {
       case 'list': {
@@ -582,6 +615,7 @@ export function apply(ctx: Context) {
           break
         }
         muxRemoteApprovals.delete(cmd.approvalId)
+        logger.info('RESPOND', `手机裁决桌面审批 approval=${cmd.approvalId.slice(0, 8)} outcome=${cmd.decision}`)
         broadcast({
           type: 'approval_resolved',
           approvalId: cmd.approvalId,
@@ -607,6 +641,7 @@ export function apply(ctx: Context) {
           break
         }
         muxQuestions.delete(cmd.rpcId)
+        logger.info('RESPOND', `手机回答桌面提问 rpc=${cmd.rpcId.slice(0, 8)} answers=${answers.length}`)
         broadcast({
           type: 'question_resolved',
           rpcId: cmd.rpcId,
@@ -621,6 +656,7 @@ export function apply(ctx: Context) {
           break
         }
         const rec = upsertDevice(cmd.deviceId, cmd.name, cmd.model)
+        logger.info('DEVICE', `设备注册 device=${cmd.deviceId.slice(0, 8)} name=${cmd.name}${cmd.model ? ` model=${cmd.model}` : ''}`)
         wsAuth.set(ws, { kind: 'device', deviceId: rec.deviceId })
         send(ws, {
           type: 'device_registered',
@@ -641,6 +677,7 @@ export function apply(ctx: Context) {
         }
         devices = devices.filter((d) => d.deviceId !== cmd.deviceId)
         saveDevices(devices)
+        logger.info('DEVICE', `设备撤销 device=${cmd.deviceId.slice(0, 8)}`)
         send(ws, { type: 'device_revoked', deviceId: cmd.deviceId })
         break
       }
@@ -655,13 +692,17 @@ export function apply(ctx: Context) {
   wss.on('connection', (ws) => {
     clients.add(ws)
     const auth = wsAuth.get(ws)
+    logger.info('WS', `客户端连接 established (auth=${auth?.kind ?? 'unknown'}, device=${auth?.deviceId ?? '-'}, 当前 ${clients.size} 个客户端)`)
     send(ws, snapshot())
+    logger.debug('WS', `已推送 hello 快照 (sessions=${listSessions().length})`)
     ws.on('message', (data) => void handleCommand(ws, data as Buffer))
     ws.on('close', () => {
       clients.delete(ws)
+      logger.info('WS', `客户端断开 (剩余 ${clients.size} 个客户端)`)
     })
     ws.on('error', (e) => {
       clients.delete(ws)
+      logger.warn('WS', `客户端连接错误: ${e.message}`)
     })
   })
 
@@ -670,10 +711,12 @@ export function apply(ctx: Context) {
     handler: (req, socket, head) => {
       const auth = authenticate(req)
       if (auth.kind === 'none') {
+        logger.warn('AUTH', `握手拒绝 (401) remote=${req.socket.remoteAddress} url=${req.url ?? ''}`)
         socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n')
         socket.destroy()
         return
       }
+      logger.debug('AUTH', `握手通过 auth=${auth.kind} device=${auth.deviceId ?? '-'}`)
       wss.handleUpgrade(req, socket, head, (ws) => {
         wsAuth.set(ws, auth)
         wss.emit('connection', ws, req)
@@ -824,12 +867,27 @@ export function apply(ctx: Context) {
       }
       // 会话策略可能被切到 never（会静默拒绝、不派发 answerer）：先切回 ask
       setApprovalPolicy(agent.session, 'ask')
+      logger.info('DEBUG', `调试端点发起审批 session=${String(agent.id).slice(0, 12)} tool=${parsed.toolName ?? 'bash'}`)
       const outcome = await approvalService.request({
         agent,
         toolName: parsed.toolName ?? 'bash',
         reason: parsed.reason ?? '调试测试审批：验证手机端审批透传链路',
       })
       json(res, { ok: true, outcome })
+    },
+  }
+
+  /** 结构化连接日志查询（loopback only，供手机日志页 / curl 排查）。 */
+  const logsRoute: WebRoute = {
+    kind: 'exact',
+    path: '/remote/logs',
+    handler: (req, res) => {
+      if (!isLoopback(req)) return denied(res)
+      const url = new URL(req.url ?? '', 'http://localhost')
+      const level = (url.searchParams.get('level') ?? undefined) as 'debug' | 'info' | 'warn' | 'error' | undefined
+      const limitRaw = Number(url.searchParams.get('limit') ?? 300)
+      const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 1000) : 300
+      json(res, { version: BRIDGE_VERSION, entries: logger.entries(level, limit) })
     },
   }
 
@@ -842,6 +900,7 @@ export function apply(ctx: Context) {
   ctx.webServer.register(devicesRoute)
   ctx.webServer.register(connectedRoute)
   ctx.webServer.register(approvalTestRoute)
+  ctx.webServer.register(logsRoute)
 
   void runMuxClient()
 
