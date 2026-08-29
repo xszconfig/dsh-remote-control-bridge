@@ -11,7 +11,7 @@ import type { Agent } from '@deepseek-ai/dsh-agent'
 import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { Session, SessionEvent } from '@deepseek-ai/dsh-session'
 import type { WebRoute, WebUpgradeRoute } from '@deepseek-ai/dsh-host-webserver'
-import type {} from '@deepseek-ai/dsh-user-approval'
+import { setApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
 import type {} from '@deepseek-ai/dsh-session-title'
 import type {} from '@deepseek-ai/dsh-workspace'
 
@@ -23,6 +23,7 @@ import {
   type DeviceRecord,
   type EventProjection,
   type PairInfo,
+  type QuestionRequestWire,
   type ServerEvent,
   type SessionSummary,
   type WorkspaceSummary,
@@ -31,7 +32,6 @@ import {
 export const name = 'dsh-remote-control-bridge'
 export const inject = ['webServer', 'sessions', 'agents', 'workspaceRegistry', 'sessionTitle']
 
-const APPROVAL_TIMEOUT_MS = 30_000
 const PAIR_TTL_MS = 10 * 60_000
 
 // ---- persisted per-machine fingerprint + paired devices (under $DSH_HOME) ----
@@ -198,6 +198,9 @@ export function apply(ctx: Context) {
     sessions: listSessions(),
     agents: listAgents(),
     workspaces: listWorkspaces(),
+    pendingApprovals: pendingApprovalList(),
+    pendingRemoteApprovals: [...muxRemoteApprovals.values()],
+    pendingQuestions: [...muxQuestions.values()],
   })
 
   const broadcast = (ev: ServerEvent): void => {
@@ -230,36 +233,240 @@ export function apply(ctx: Context) {
     broadcast({ type: 'agent_status', sessionId: String(agent.id), status })
   })
 
-  // ---- approval answerer (mobile decides) ----
-  const pending = new Map<string, (outcome: 'allowed-once' | 'rejected') => void>()
+  // ---- approval answerer (mobile decides; desktop falls back) ----
+
+  /**
+   * 挂起审批表：approvalId -> 裁决闭包。审批到达时若存在已连接手机，本 bridge
+   * 以 prepend 监听抢先认领（先于桌面端 apiproxy answerer）；手机裁决后回传。
+   * 无人裁决的超时兜底时长（毫秒），可用 DSH_REMOTE_APPROVAL_TIMEOUT_MS 覆盖。
+   */
+  const approvalHoldTimeoutMs = Number(process.env.DSH_REMOTE_APPROVAL_TIMEOUT_MS ?? 30 * 60_000)
+  const pendingApprovals = new Map<
+    string,
+    ApprovalRequestWire & { resolve: (outcome: 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable') => void; timer: NodeJS.Timeout }
+  >()
+
+  const pendingApprovalList = (): ApprovalRequestWire[] =>
+    [...pendingApprovals.values()].map(({ resolve: _r, timer: _t, ...wire }) => wire)
+
+  /** 与桌面端相同的审计关联：从会话日志找到最新一条未裁决且 callId 匹配的 approval/asked。 */
+  const approvalIdOf = (req: { callId?: string; agent: Agent }): string | undefined => {
+    const events = req.agent.session.events
+    const claimed = new Set(pendingApprovals.keys())
+    const decided = new Set<string>()
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const event = events[i]
+      if (event.type === 'approval/decided') decided.add(String(event.data.id))
+      else if (event.type === 'approval/asked') {
+        const id = String(event.data.id)
+        if (decided.has(id) || claimed.has(id)) continue
+        if ((req.callId ?? null) !== (event.data.callId ?? null)) continue
+        return id
+      }
+    }
+    return undefined
+  }
+
+  /** 关联工具调用时提取可读命令文本（bash 等工具的命令字段）。 */
+  const commandOfCall = (session: Session, callId: string): string | undefined => {
+    for (let i = session.events.length - 1; i >= 0; i -= 1) {
+      const event = session.events[i]
+      if (event.type !== 'tool/call') continue
+      if (String(event.data.callId ?? '') !== callId) continue
+      try {
+        const args = typeof event.data.arguments === 'string'
+          ? JSON.parse(event.data.arguments)
+          : (event.data.arguments ?? {})
+        if (typeof args.command === 'string' && args.command !== '') return args.command
+        return undefined
+      } catch {
+        return undefined
+      }
+    }
+    return undefined
+  }
+
   ctx.on('approval/request', async (req, next) => {
-    const approvalId = randomUUID()
+    if (req.signal?.aborted === true) {
+      return 'cancelled'
+    }
+    // 没有已连接手机：不认领，直接放行给桌面端 answerer。
+    if (clients.size === 0) {
+      return next()
+    }
+
+    const approvalId = approvalIdOf(req)
+    if (approvalId === undefined) {
+      return next()
+    }
+
     const approval: ApprovalRequestWire = {
       approvalId,
       sessionId: String(req.agent.id),
       toolName: req.toolName,
-      reason: req.reason,
+      ...(req.callId !== undefined ? { callId: req.callId } : {}),
+      ...(req.reason !== undefined ? { reason: req.reason } : {}),
+      ...(() => { const c = req.callId !== undefined ? commandOfCall(req.agent.session, req.callId) : undefined; return c !== undefined ? { command: c } : {} })(),
+      requestedAt: Date.now(),
     }
-    broadcast({ type: 'approval_request', approval })
 
-    const outcome = await new Promise<'allowed-once' | 'rejected' | undefined>((resolve) => {
+
+    return await new Promise<'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'>((resolve) => {
+      let settled = false
+      const entry = pendingApprovals.get(approvalId)
+      const settle = (outcome: 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable') => {
+        if (settled) return
+        settled = true
+        clearTimeout(entry?.timer)
+        pendingApprovals.delete(approvalId)
+        req.signal?.removeEventListener('abort', onAbort)
+        broadcast({ type: 'approval_resolved', approvalId, sessionId: approval.sessionId, outcome })
+        resolve(outcome)
+      }
+      const onAbort = () => settle('cancelled')
       const timer = setTimeout(() => {
-        pending.delete(approvalId)
-        resolve(undefined)
-      }, APPROVAL_TIMEOUT_MS)
-      pending.set(approvalId, (o) => {
-        clearTimeout(timer)
-        resolve(o)
-      })
+        settle('unavailable')
+      }, approvalHoldTimeoutMs)
+      pendingApprovals.set(approvalId, { ...approval, resolve: settle, timer })
+      req.signal?.addEventListener('abort', onAbort, { once: true })
+      broadcast({ type: 'approval_request', approval })
     })
+  }, { prepend: true })
 
-    if (outcome) {
-      broadcast({ type: 'approval_settled', approvalId, outcome })
-      return outcome
+  // ---- mux 客户端：转发桌面端（apiproxy）持有的审批与提问到手机 ----
+
+  /** 桌面端持有、经 mux 转发的审批（approvalId -> wire，rpcId 附着）。 */
+  const muxRemoteApprovals = new Map<string, ApprovalRequestWire>()
+  /** 桌面端持有、经 mux 转发的提问（rpcId -> wire）。 */
+  const muxQuestions = new Map<string, QuestionRequestWire>()
+  let muxStopped = false
+  let muxWs: WebSocket | null = null
+
+  /** 经 /api/respond 回传手机裁决给桌面端 answerer（返回是否被接受）。 */
+  const respondToDesktop = async (rpcId: string, value: unknown): Promise<boolean> => {
+    try {
+      const res = await fetch(`http://127.0.0.1:${ctx.webServer.port}/api/respond`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        // client-response 完整形态要求 type 判别字段
+        body: JSON.stringify({ type: 'client-response', rpcId, result: { ok: true, value } }),
+        signal: AbortSignal.timeout(5000),
+      })
+      if (!res.ok) {
+        return false
+      }
+      const receipt = (await res.json()) as { accepted?: boolean; reason?: string }
+      if (receipt.accepted !== true) {
+      } else {
+      }
+      return receipt.accepted === true
+    } catch (e) {
+      return false
     }
-    // Timed out with no connected decision-maker — fall through to other answerers.
-    return next()
-  })
+  }
+
+  const handleMuxFrame = (envelope: { rpcId?: string; payload?: { type?: string } & Record<string, unknown> }): void => {
+    const payload = envelope.payload
+    if (!payload?.type) return
+    const rpcId = envelope.rpcId ?? ''
+    switch (payload.type) {
+      case 'approval/requested': {
+        const f = payload as { sessionId: string; approvalId: string; toolName: string; callId?: string; reason?: string }
+        if (pendingApprovals.has(f.approvalId)) return // 本 bridge 已持有（防御性去重）
+        const session = ctx.sessions.list().find((s) => String(s.id) === f.sessionId)
+        const command = f.callId !== undefined && session ? commandOfCall(session, f.callId) : undefined
+        const wire: ApprovalRequestWire = {
+          approvalId: f.approvalId,
+          sessionId: f.sessionId,
+          toolName: f.toolName,
+          ...(f.callId !== undefined ? { callId: f.callId } : {}),
+          ...(f.reason !== undefined ? { reason: f.reason } : {}),
+          ...(command !== undefined ? { command } : {}),
+          requestedAt: Date.now(),
+          rpcId,
+        }
+        muxRemoteApprovals.set(f.approvalId, wire)
+        broadcast({ type: 'approval_request', approval: wire })
+        break
+      }
+      case 'approval/resolved': {
+        const f = payload as { approvalId: string; sessionId: string; outcome: string }
+        muxRemoteApprovals.delete(f.approvalId)
+        broadcast({
+          type: 'approval_resolved',
+          approvalId: f.approvalId,
+          sessionId: f.sessionId,
+          outcome: (f.outcome as 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable') ?? 'unavailable',
+        })
+        break
+      }
+      case 'question/requested': {
+        const f = payload as { sessionId: string; questions: QuestionRequestWire['questions'] }
+        const wire: QuestionRequestWire = {
+          rpcId,
+          sessionId: f.sessionId,
+          questions: f.questions,
+          requestedAt: Date.now(),
+        }
+        muxQuestions.set(rpcId, wire)
+        broadcast({ type: 'question_request', question: wire })
+        break
+      }
+      case 'question/resolved': {
+        const f = payload as { sessionId: string; questionRpcId: string; outcome: string }
+        muxQuestions.delete(f.questionRpcId)
+        broadcast({
+          type: 'question_resolved',
+          rpcId: f.questionRpcId,
+          sessionId: f.sessionId,
+          outcome: (f.outcome as 'answered' | 'cancelled') ?? 'cancelled',
+        })
+        break
+      }
+      default:
+        break
+    }
+    // 缓存过期清扫（30 分钟未解决视为失效）
+    const now = Date.now()
+    for (const [id, wire] of muxRemoteApprovals) if (now - wire.requestedAt > 30 * 60_000) muxRemoteApprovals.delete(id)
+    for (const [id, wire] of muxQuestions) if (now - wire.requestedAt > 30 * 60_000) muxQuestions.delete(id)
+  }
+
+  /** 维护与 /api/events.mux 的 WebSocket 长连接（只读下链，断开自动重连）。 */
+  const runMuxClient = async (): Promise<void> => {
+    let failures = 0
+    while (!muxStopped) {
+      await new Promise<void>((resolve) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${ctx.webServer.port}/api/events.mux`)
+        muxWs = ws
+        let settled = false
+        const settle = () => {
+          if (settled) return
+          settled = true
+          resolve()
+        }
+        ws.on('open', () => {
+          failures = 0
+        })
+        ws.on('message', (data) => {
+          try {
+            const parsed = JSON.parse(data.toString()) as { rpcId?: string; payload?: { type?: string } & Record<string, unknown> }
+            handleMuxFrame(parsed)
+          } catch {
+            // 单帧损坏不致命，跳过
+          }
+        })
+        ws.on('close', settle)
+        ws.on('error', (e) => {
+          failures += 1
+          settle()
+        })
+      })
+      if (muxStopped) return
+      // 指数退避重连（1s 起，封顶 30s）；重连后桌面端会重放未决帧
+      await new Promise((r) => setTimeout(r, Math.min(1000 * 2 ** Math.min(failures, 5), 30_000)))
+    }
+  }
 
   // ---- connection auth ----
 
@@ -300,7 +507,7 @@ export function apply(ctx: Context) {
 
   const wsAuth = new WeakMap<WebSocket, WsAuth>()
 
-  const handleCommand = (ws: WebSocket, raw: Buffer): void => {
+  const handleCommand = async (ws: WebSocket, raw: Buffer): Promise<void> => {
     let cmd: ClientCommand
     try {
       cmd = JSON.parse(raw.toString()) as ClientCommand
@@ -308,6 +515,17 @@ export function apply(ctx: Context) {
       send(ws, { type: 'error', code: 'bad_json', message: 'invalid JSON' })
       return
     }
+    const extra = [
+      'sessionId' in cmd && typeof (cmd as { sessionId?: unknown }).sessionId === 'string'
+        ? `session=${(cmd as { sessionId: string }).sessionId.slice(0, 12)}`
+        : '',
+      'approvalId' in cmd && typeof (cmd as { approvalId?: unknown }).approvalId === 'string'
+        ? `approval=${(cmd as { approvalId: string }).approvalId.slice(0, 8)}`
+        : '',
+      'rpcId' in cmd && typeof (cmd as { rpcId?: unknown }).rpcId === 'string'
+        ? `rpc=${(cmd as { rpcId: string }).rpcId.slice(0, 8)}`
+        : '',
+    ].filter(Boolean).join(' ')
 
     switch (cmd.type) {
       case 'list': {
@@ -345,13 +563,56 @@ export function apply(ctx: Context) {
         break
       }
       case 'approve': {
-        const resolve = pending.get(cmd.approvalId)
-        if (!resolve) {
+        const entry = pendingApprovals.get(cmd.approvalId)
+        if (!entry) {
           send(ws, { type: 'error', code: 'not_found', message: `approval not found: ${cmd.approvalId}` })
           break
         }
-        pending.delete(cmd.approvalId)
-        resolve(cmd.decision)
+        entry.resolve(cmd.decision)
+        break
+      }
+      case 'answer_approval': {
+        const ok = await respondToDesktop(cmd.rpcId, {
+          sessionId: cmd.sessionId,
+          approvalId: cmd.approvalId,
+          outcome: cmd.decision,
+        })
+        if (!ok) {
+          send(ws, { type: 'error', code: 'not_found', message: `approval not pending: ${cmd.approvalId}` })
+          break
+        }
+        muxRemoteApprovals.delete(cmd.approvalId)
+        broadcast({
+          type: 'approval_resolved',
+          approvalId: cmd.approvalId,
+          sessionId: cmd.sessionId,
+          outcome: cmd.decision,
+        })
+        break
+      }
+      case 'answer_question': {
+        // 归一化答案：客户端（kotlinx encodeDefaults）可能显式带 custom:null，
+        // 而桌面端 zod 的 z.string().optional() 只接受缺省、拒绝 null。
+        const answers = cmd.answers.map((a) => ({
+          id: a.id,
+          selected: a.selected ?? [],
+          ...(a.custom !== undefined && a.custom !== null && a.custom !== '' ? { custom: a.custom } : {}),
+        }))
+        const ok = await respondToDesktop(cmd.rpcId, {
+          sessionId: cmd.sessionId,
+          answer: { answers },
+        })
+        if (!ok) {
+          send(ws, { type: 'error', code: 'not_found', message: `question answer rejected: ${cmd.rpcId}` })
+          break
+        }
+        muxQuestions.delete(cmd.rpcId)
+        broadcast({
+          type: 'question_resolved',
+          rpcId: cmd.rpcId,
+          sessionId: cmd.sessionId,
+          outcome: 'answered',
+        })
         break
       }
       case 'register_device': {
@@ -393,10 +654,15 @@ export function apply(ctx: Context) {
   const wss = new WebSocketServer({ noServer: true })
   wss.on('connection', (ws) => {
     clients.add(ws)
+    const auth = wsAuth.get(ws)
     send(ws, snapshot())
-    ws.on('message', (data) => handleCommand(ws, data as Buffer))
-    ws.on('close', () => clients.delete(ws))
-    ws.on('error', () => clients.delete(ws))
+    ws.on('message', (data) => void handleCommand(ws, data as Buffer))
+    ws.on('close', () => {
+      clients.delete(ws)
+    })
+    ws.on('error', (e) => {
+      clients.delete(ws)
+    })
   })
 
   const upgrade: WebUpgradeRoute = {
@@ -440,7 +706,7 @@ export function apply(ctx: Context) {
     kind: 'exact',
     path: '/remote/pair-info',
     handler: (req, res) => {
-      if (!isLoopback(req)) return denied(res)
+      if (!allowLocalOrEnvToken(req, res, envToken)) return denied(res)
       const pairToken = randomBytes(16).toString('hex')
       pairTokens.set(pairToken, Date.now() + PAIR_TTL_MS)
       const info = buildPairInfo(req, pairToken, ctx.webServer.port, ctx.webServer.host)
@@ -452,7 +718,7 @@ export function apply(ctx: Context) {
     kind: 'exact',
     path: '/remote/pair',
     handler: async (req, res) => {
-      if (!isLoopback(req)) return denied(res)
+      if (!allowLocalOrEnvToken(req, res, envToken)) return denied(res)
       const pairToken = randomBytes(16).toString('hex')
       pairTokens.set(pairToken, Date.now() + PAIR_TTL_MS)
       const info = buildPairInfo(req, pairToken, ctx.webServer.port, ctx.webServer.host)
@@ -485,7 +751,7 @@ export function apply(ctx: Context) {
     kind: 'exact',
     path: '/remote/devices',
     handler: (req, res) => {
-      if (!isLoopback(req)) return denied(res)
+      if (!allowLocalOrEnvToken(req, res, envToken)) return denied(res)
       json(
         res,
         devices.map((d) => ({
@@ -505,7 +771,7 @@ export function apply(ctx: Context) {
     kind: 'exact',
     path: '/remote/connected',
     handler: (req, res) => {
-      if (!isLoopback(req)) return denied(res)
+      if (!allowLocalOrEnvToken(req, res, envToken)) return denied(res)
       const seen = new Map<string, { deviceId: string; name: string; model?: string; connectedAt: number }>()
       for (const ws of clients) {
         if (ws.readyState !== WebSocket.OPEN) continue
@@ -525,6 +791,48 @@ export function apply(ctx: Context) {
     },
   }
 
+  /** 测试用：在当前会话内直接发起一次真实审批（loopback only）。 */
+  const approvalTestRoute: WebRoute = {
+    kind: 'exact',
+    path: '/remote/debug/approval-test',
+    handler: async (req, res) => {
+      if (!isLoopback(req)) return denied(res)
+      if (req.method !== 'POST') {
+        json(res, { error: 'POST only' }, 405)
+        return
+      }
+      let body = ''
+      for await (const chunk of req) body += typeof chunk === 'string' ? chunk : chunk.toString()
+      let parsed: { sessionId?: string; toolName?: string; reason?: string }
+      try {
+        parsed = JSON.parse(body) as typeof parsed
+      } catch {
+        json(res, { error: 'bad json' }, 400)
+        return
+      }
+      const approvalService = ctx.get('approval') as { request?: (r: unknown) => Promise<string> } | undefined
+      if (!approvalService || typeof approvalService.request !== 'function') {
+        json(res, { error: 'approval service unavailable' }, 404)
+        return
+      }
+      const agent = parsed.sessionId
+        ? agentOf(String(parsed.sessionId))
+        : allAgents().find((a) => a.status === 'running')
+      if (!agent) {
+        json(res, { error: 'no live agent' }, 404)
+        return
+      }
+      // 会话策略可能被切到 never（会静默拒绝、不派发 answerer）：先切回 ask
+      setApprovalPolicy(agent.session, 'ask')
+      const outcome = await approvalService.request({
+        agent,
+        toolName: parsed.toolName ?? 'bash',
+        reason: parsed.reason ?? '调试测试审批：验证手机端审批透传链路',
+      })
+      json(res, { ok: true, outcome })
+    },
+  }
+
   ctx.webServer.registerUpgrade(upgrade)
   ctx.webServer.register(ping)
   ctx.webServer.register(health)
@@ -533,12 +841,21 @@ export function apply(ctx: Context) {
   ctx.webServer.register(pairPage)
   ctx.webServer.register(devicesRoute)
   ctx.webServer.register(connectedRoute)
+  ctx.webServer.register(approvalTestRoute)
+
+  void runMuxClient()
 
   ctx.effect(() => () => {
+    muxStopped = true
+    muxWs?.close()
     for (const ws of clients) ws.close()
     clients.clear()
     wss.close()
     clearInterval(pairPrune)
+    for (const entry of pendingApprovals.values()) {
+      clearTimeout(entry.timer)
+      entry.resolve('cancelled')
+    }
   })
 }
 
@@ -594,6 +911,22 @@ function headerHostIp(hostHeader: string | undefined): string | null {
 function isLoopback(req: IncomingMessage): boolean {
   const addr = req.socket.remoteAddress ?? ''
   return addr === '127.0.0.1' || addr === '::1' || addr === '::ffff:127.0.0.1'
+}
+
+function isLoopbackHostHeader(req: IncomingMessage): boolean {
+  const host = (req.headers.host ?? '').split(':')[0].toLowerCase().replace(/^\[|\]$/g, '')
+  return host === '127.0.0.1' || host === 'localhost' || host === '::1'
+}
+
+/**
+ * Local-only surfaces: allow genuine loopback requests (Host header must also be
+ * loopback, so traffic arriving via a local reverse tunnel is NOT trusted), or
+ * non-loopback requests that present the env token.
+ */
+function allowLocalOrEnvToken(req: IncomingMessage, res: ServerResponse, envToken: string): boolean {
+  if (isLoopback(req) && isLoopbackHostHeader(req)) return true
+  if (envToken && bearerToken(req.headers.authorization) === envToken) return true
+  return false
 }
 
 function bearerToken(header: string | undefined): string | null {

@@ -57,7 +57,45 @@ export interface ApprovalRequestWire {
   approvalId: string
   sessionId: string
   toolName: string
+  /** 关联的工具调用 id（有则透传，客户端可定位对应命令）。 */
+  callId?: string
+  /** 请求方的可读理由（桌面端主文案来源）。 */
   reason?: string
+  /** 关联工具调用时提取的命令文本（如 bash 命令），无则缺省。 */
+  command?: string
+  /** 服务端请求时间（epoch ms）。 */
+  requestedAt: number
+  /**
+   * 由桌面端 apiproxy 持有（bridge 未认领）时的 mux rpcId：手机裁决走
+   * `answer_approval` 命令（经 /api/respond）。缺省 = 本 bridge 持有，走 `approve`。
+   */
+  rpcId?: string
+}
+
+// ---- 提问（ask_user_question：桌面 apiproxy 持有，bridge 经 mux 转发到手机）----
+
+export interface QuestionOptionWire {
+  label: string
+  description?: string
+}
+export interface QuestionItemWire {
+  id: string
+  question: string
+  header?: string
+  detail?: string
+  options?: QuestionOptionWire[]
+  multiSelect?: boolean
+}
+export interface QuestionRequestWire {
+  rpcId: string
+  sessionId: string
+  questions: QuestionItemWire[]
+  requestedAt: number
+}
+export interface QuestionAnswerItemWire {
+  id: string
+  selected: string[]
+  custom?: string
 }
 
 // ---- client -> server commands ----
@@ -80,6 +118,21 @@ export interface CmdApprove {
   approvalId: string
   decision: 'allowed-once' | 'rejected'
 }
+/** 裁决桌面端持有的审批（mux rpcId → /api/respond）。 */
+export interface CmdAnswerApproval {
+  type: 'answer_approval'
+  rpcId: string
+  sessionId: string
+  approvalId: string
+  decision: 'allowed-once' | 'rejected'
+}
+/** 回答桌面端持有的提问（mux rpcId → /api/respond）。 */
+export interface CmdAnswerQuestion {
+  type: 'answer_question'
+  rpcId: string
+  sessionId: string
+  answers: QuestionAnswerItemWire[]
+}
 export interface CmdList {
   type: 'list'
 }
@@ -101,6 +154,8 @@ export type ClientCommand =
   | CmdSendMessage
   | CmdInterrupt
   | CmdApprove
+  | CmdAnswerApproval
+  | CmdAnswerQuestion
   | CmdList
   | CmdRegisterDevice
   | CmdRevokeDevice
@@ -118,6 +173,12 @@ export interface EvHello {
   agents: AgentSummary[]
   /** Workspaces in durable registry order. */
   workspaces: WorkspaceSummary[]
+  /** 当前由本 bridge 持有、等待手机裁决的审批（连接/重连时补发）。 */
+  pendingApprovals: ApprovalRequestWire[]
+  /** 桌面端持有、bridge 经 mux 转发的审批（手机裁决走 answer_approval）。 */
+  pendingRemoteApprovals: ApprovalRequestWire[]
+  /** 桌面端持有、bridge 经 mux 转发的提问（手机回答走 answer_question）。 */
+  pendingQuestions: QuestionRequestWire[]
 }
 export interface EvSessions {
   type: 'sessions'
@@ -141,10 +202,21 @@ export interface EvApprovalRequest {
   type: 'approval_request'
   approval: ApprovalRequestWire
 }
-export interface EvApprovalSettled {
-  type: 'approval_settled'
+export interface EvApprovalResolved {
+  type: 'approval_resolved'
   approvalId: string
-  outcome: string
+  sessionId: string
+  outcome: 'allowed-once' | 'rejected' | 'cancelled' | 'unavailable'
+}
+export interface EvQuestionRequest {
+  type: 'question_request'
+  question: QuestionRequestWire
+}
+export interface EvQuestionResolved {
+  type: 'question_resolved'
+  rpcId: string
+  sessionId: string
+  outcome: 'answered' | 'cancelled'
 }
 export interface EvHistory {
   type: 'history'
@@ -184,7 +256,9 @@ export type ServerEvent =
   | EvSessionTitle
   | EvAgentStatus
   | EvApprovalRequest
-  | EvApprovalSettled
+  | EvApprovalResolved
+  | EvQuestionRequest
+  | EvQuestionResolved
   | EvError
   | EvDeviceRegistered
   | EvDeviceRevoked
@@ -223,4 +297,4 @@ export interface DeviceRecord {
   lastSeenAt: number
 }
 
-export const BRIDGE_VERSION = '0.3.0'
+export const BRIDGE_VERSION = '0.5.0'
