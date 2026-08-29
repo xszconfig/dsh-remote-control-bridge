@@ -1484,6 +1484,7 @@ function truncateResult(text: string): string {
 /**
  * 按"投影后的可见行"取窗口：从 seq < beforeSeq（undefined = 最尾部）向前扫描原始事件，
  * 逐条投影、攒满 limit 行或扫到最开头。单个原始事件的多行投影原子收集（think+正文同 seq）。
+ * 返回 **旧→新** 顺序（客户端 events 约定旧在前新在后，live 事件追加在末尾）。
  * hasMore：攒满 limit 且仍有未扫描的原始事件时为 true（剩余可能全不可投影，
  * 下一请求会空页返回并置 false，不会死循环）。
  */
@@ -1504,6 +1505,7 @@ function projectWindowBack(
     idx--
     if (events.length >= limit) break
   }
+  events.reverse() // 逆序扫描收集的，翻回旧→新
   return { events, hasMore: events.length >= limit && idx >= 0 }
 }
 
