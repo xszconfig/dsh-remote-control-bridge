@@ -8,7 +8,7 @@ import { WebSocket, WebSocketServer } from 'ws'
 import QRCode from 'qrcode'
 import { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
+import { createUserMessage, MessageId, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import { SessionId, type Session, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
 import type { WebRoute, WebUpgradeRoute } from '@deepseek-ai/dsh-host-webserver'
 import { setApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
@@ -27,6 +27,7 @@ import {
   type EvHello,
   type PairInfo,
   type QuestionRequestWire,
+  type QueueItemWire,
   type ServerEvent,
   type SessionSummary,
   type WorkspaceSummary,
@@ -309,6 +310,20 @@ export function apply(ctx: Context) {
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(ev))
   }
 
+  /** 排队消息投影（与桌面端 session/queue 同源）：nextTurn → queued，nextStep → steering/context。 */
+  const queueItemsOf = (agent: Agent): QueueItemWire[] => [
+    ...agent.inbox.nextTurn.map((m) => ({
+      id: m.id,
+      placement: 'queued' as const,
+      text: truncateResult(extractText(m.content)),
+    })),
+    ...agent.inbox.nextStep.map((m) => ({
+      id: m.id,
+      placement: (m.source.kind === 'user' ? 'steering' : 'context') as 'steering' | 'context',
+      text: truncateResult(extractText(m.content)),
+    })),
+  ]
+
   // ---- live event fan-out ----
   ctx.on('session/event', (session, event) => {
     if (event.type === 'session/title') {
@@ -317,6 +332,14 @@ export function apply(ctx: Context) {
         sessionId: String(session.id),
         title: event.data.title,
       })
+      return
+    }
+    // 排队队列变化（inbox splice）→ 推给手机
+    if (event.type === 'agent/inbox/spliced') {
+      const agent = ctx.agents.get(session.id)
+      if (agent?.session === session) {
+        broadcast({ type: 'session_queue', sessionId: String(session.id), items: queueItemsOf(agent) })
+      }
       return
     }
     const proj = projectEvent(event)
@@ -683,6 +706,40 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
         void snapshot().then((snap) => send(ws, snap))
         break
       }
+      case 'queue_action': {
+        const agent = ctx.agents.get(SessionId(cmd.sessionId))
+        if (agent === undefined || String(agent.id) !== cmd.sessionId) {
+          send(ws, { type: 'error', code: 'not_found', message: 'agent not attached' })
+          break
+        }
+        const target = agent.inbox.nextTurn.some((m) => m.id === cmd.itemId)
+          ? 'next-turn'
+          : agent.inbox.nextStep.some((m) => m.id === cmd.itemId)
+            ? 'next-step'
+            : undefined
+        if (target === undefined) {
+          send(ws, { type: 'error', code: 'queue-item-not-found', message: '排队消息已不在队列中' })
+          break
+        }
+        const message = (target === 'next-turn' ? agent.inbox.nextTurn : agent.inbox.nextStep)
+          .find((m) => m.id === cmd.itemId)
+        if (message === undefined) {
+          send(ws, { type: 'error', code: 'queue-item-not-found', message: '排队消息已不在队列中' })
+          break
+        }
+        if (cmd.action === 'steer') {
+          if (target !== 'next-turn' || agent.status !== 'running') {
+            send(ws, { type: 'error', code: 'steer-unavailable', message: '当前轮次不接受插队' })
+            break
+          }
+          agent.inbox.remove(MessageId(cmd.itemId))
+          agent.steer(message)
+        } else {
+          agent.inbox.remove(MessageId(cmd.itemId))
+        }
+        logger.info('QUEUE', `排队操作 ${cmd.action} item=${cmd.itemId.slice(0, 8)} session=${cmd.sessionId.slice(0, 12)}`)
+        break
+      }
       case 'subscribe': {
         if (!cmd.sessionId) {
           send(ws, { type: 'error', code: 'not_found', message: 'subscribe 需要 sessionId' })
@@ -693,7 +750,13 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
           const history = liveSession.events
             .map(projectEvent)
             .filter((e): e is EventProjection => e !== null)
-          send(ws, { type: 'history', sessionId: String(liveSession.id), events: history })
+          const agent = ctx.agents.get(liveSession.id)
+          send(ws, {
+            type: 'history',
+            sessionId: String(liveSession.id),
+            events: history,
+            ...(agent?.session === liveSession ? { queue: queueItemsOf(agent) } : {}),
+          })
           break
         }
         // 冷会话：从持久化层读历史（只读，不拉起 agent）

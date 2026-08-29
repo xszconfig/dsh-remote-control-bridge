@@ -138,6 +138,13 @@ export interface CmdAnswerQuestion {
 export interface CmdList {
   type: 'list'
 }
+/** 排队消息操作：steer = 插队（作为 steering 注入当前轮）；remove = 移除。 */
+export interface CmdQueueAction {
+  type: 'queue_action'
+  sessionId: string
+  itemId: string
+  action: 'steer' | 'remove'
+}
 /** Pair a phone with the desktop: exchange a long-lived per-device token. */
 export interface CmdRegisterDevice {
   type: 'register_device'
@@ -159,6 +166,7 @@ export type ClientCommand =
   | CmdAnswerApproval
   | CmdAnswerQuestion
   | CmdList
+  | CmdQueueAction
   | CmdRegisterDevice
   | CmdRevokeDevice
 
@@ -224,6 +232,19 @@ export interface EvHistory {
   type: 'history'
   sessionId: string
   events: EventProjection[]
+  /** 该会话当前排队的消息（inbox 投影）；缺省 = 无排队。 */
+  queue?: QueueItemWire[]
+}
+/** 排队消息投影：placement = queued(下一轮)/steering(用户插队中)/context(系统注入)。 */
+export interface QueueItemWire {
+  id: string
+  placement: 'queued' | 'steering' | 'context'
+  text: string
+}
+export interface EvSessionQueue {
+  type: 'session_queue'
+  sessionId: string
+  items: QueueItemWire[]
 }
 /** A session's durable title changed (user rename or automatic generation). */
 export interface EvSessionTitle {
@@ -266,6 +287,7 @@ export type ServerEvent =
   | EvAgents
   | EvEvent
   | EvHistory
+  | EvSessionQueue
   | EvSessionTitle
   | EvSessionUpsert
   | EvAgentStatus
@@ -311,4 +333,4 @@ export interface DeviceRecord {
   lastSeenAt: number
 }
 
-export const BRIDGE_VERSION = '0.7.0'
+export const BRIDGE_VERSION = '0.8.0'
