@@ -1405,14 +1405,26 @@ function projectEvent(event: SessionEvent): EventProjection | null {
       return { ...base, type: 'assistant_message', text }
     }
     case 'tool/call': {
-      return { ...base, type: 'tool_call', toolName: event.data.name, toolArgs: event.data.arguments }
+      const callId = (event.data as { callId?: unknown }).callId
+      return {
+        ...base,
+        type: 'tool_call',
+        toolName: event.data.name,
+        toolArgs: event.data.arguments,
+        ...(callId !== undefined ? { callId: String(callId) } : {}),
+      }
     }
     case 'tool/result': {
+      const data = event.data as { message?: { content?: readonly ContentBlock[] }; error?: unknown }
+      const cid = (data.message?.content as readonly ({ toolCallId?: unknown } | null)[] | undefined)
+        ?.find((b) => (b as { toolCallId?: unknown } | null)?.toolCallId !== undefined)
+        ?.toolCallId
       return {
         ...base,
         type: 'tool_result',
-        toolResult: truncateResult(extractText(event.data.message.content)),
-        toolError: event.data.error !== undefined,
+        toolResult: truncateResult(extractText(data.message?.content)),
+        toolError: data.error !== undefined,
+        ...(cid !== undefined ? { callId: String(cid) } : {}),
       }
     }
     default:

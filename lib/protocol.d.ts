@@ -39,6 +39,8 @@ export interface EventProjection {
     toolResult?: string;
     toolError?: boolean;
     timestamp: number;
+    /** 工具调用/结果关联 id：客户端据此把失败的命令标红。 */
+    callId?: string;
 }
 export interface ApprovalRequestWire {
     approvalId: string;
