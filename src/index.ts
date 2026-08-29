@@ -1084,8 +1084,23 @@ function extractText(content: readonly ContentBlock[] | undefined): string {
   let out = ''
   for (const b of content) {
     if (b.type === 'text') out += b.text
+    else {
+      // 容器块（tool-result 等）：真实结果嵌套在内层 content[]，递归提取
+      const nested = (b as { content?: readonly ContentBlock[] }).content
+      if (Array.isArray(nested)) {
+        const inner = extractText(nested)
+        if (inner) out += (out ? '\n' : '') + inner
+      }
+    }
   }
   return out
+}
+
+/** 工具结果上限：长输出截断（手机展示用，桌面端保留全量）。 */
+const TOOL_RESULT_MAX_CHARS = 4000
+function truncateResult(text: string): string {
+  if (text.length <= TOOL_RESULT_MAX_CHARS) return text
+  return `${text.slice(0, TOOL_RESULT_MAX_CHARS)}\n…(已截断，共 ${text.length} 字符)`
 }
 
 function projectEvent(event: SessionEvent): EventProjection | null {
@@ -1108,7 +1123,7 @@ function projectEvent(event: SessionEvent): EventProjection | null {
       return {
         ...base,
         type: 'tool_result',
-        toolResult: extractText(event.data.message.content),
+        toolResult: truncateResult(extractText(event.data.message.content)),
         toolError: event.data.error !== undefined,
       }
     }
