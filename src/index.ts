@@ -1178,8 +1178,8 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
     handler: async (req, res) => {
       if (!isLoopback(req)) return denied(res)
       const url = new URL(req.url ?? '', 'http://localhost')
-      const waitRaw = Number(url.searchParams.get('wait') ?? 3000)
-      const wait = Number.isFinite(waitRaw) ? Math.min(Math.max(waitRaw, 500), 8000) : 3000
+      const waitRaw = Number(url.searchParams.get('wait') ?? 8000)
+      const wait = Number.isFinite(waitRaw) ? Math.min(Math.max(waitRaw, 500), 20_000) : 8000
       const requestId = randomUUID()
       const before = phoneLogBuffer.length
       broadcast({ type: 'logs_request', requestId })
@@ -1189,7 +1189,10 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
         await new Promise((r) => setTimeout(r, 100))
       }
       const entries = phoneLogBuffer.slice(before)
-      json(res, { ok: true, requestId, count: entries.length, entries })
+      // 手机恰在重连中时响应可能晚于等待窗口：无新回传时退回最近的缓冲尾部
+      const fallback = entries.length > 0 ? [] : phoneLogBuffer.slice(-300)
+      const out = entries.length > 0 ? entries : fallback
+      json(res, { ok: true, requestId, count: out.length, fresh: entries.length > 0, entries: out })
     },
   }
 
