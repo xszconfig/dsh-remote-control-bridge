@@ -16,6 +16,7 @@ import type { SessionProjectionCache } from '@deepseek-ai/dsh-session-projection
 import type {} from '@deepseek-ai/dsh-session-title'
 import type {} from '@deepseek-ai/dsh-workspace'
 import type {} from '@deepseek-ai/dsh-session-persistence'
+import type {} from '@deepseek-ai/dsh-tools'
 
 import {
   BRIDGE_VERSION,
@@ -36,7 +37,7 @@ import {
 import { ConnLogger } from './logger.js'
 
 export const name = 'dsh-remote-control-bridge'
-export const inject = ['webServer', 'sessions', 'agents', 'workspaceRegistry', 'sessionTitle', 'sessionPersistence']
+export const inject = ['webServer', 'sessions', 'agents', 'workspaceRegistry', 'sessionTitle', 'sessionPersistence', 'tools']
 
 const PAIR_TTL_MS = 10 * 60_000
 
@@ -338,8 +339,8 @@ export function apply(ctx: Context) {
   const HISTORY_TAIL = 300
 
   /** 事件投影（批量）：null 投影（无关事件类型）丢弃。 */
-  const projectEvents = (events: readonly SessionEvent[]): EventProjection[] =>
-    events.map(projectEvent).filter((e): e is EventProjection => e !== null)
+  const projectEvents = (events: readonly SessionEvent[], scope?: unknown): EventProjection[] =>
+    events.flatMap((event) => projectEvent(ctx, event, scope))
 
   /**
    * 冷会话原始事件缓存：翻页复用，避免每页都重读/重解析整份日志。
@@ -401,9 +402,10 @@ export function apply(ctx: Context) {
       }
       return
     }
-    const proj = projectEvent(event)
-    if (!proj) return
-    broadcast({ type: 'event', sessionId: String(session.id), event: proj })
+    const scope = ctx.agents.get(session.id)
+    for (const proj of projectEvent(ctx, event, scope)) {
+      broadcast({ type: 'event', sessionId: String(session.id), event: proj })
+    }
   })
 
   ctx.on('agent/status', ({ agent, status }) => {
@@ -816,7 +818,7 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
         const liveSession = ctx.sessions.list().find((x) => String(x.id) === cmd.sessionId)
         if (liveSession) {
           const all = liveSession.events
-          const history = projectEvents(all.slice(-HISTORY_TAIL))
+          const history = projectEvents(all.slice(-HISTORY_TAIL), ctx.agents.get(liveSession.id))
           const agent = ctx.agents.get(liveSession.id)
           send(ws, {
             type: 'history',
@@ -858,7 +860,7 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
         send(ws, {
           type: 'history',
           sessionId: sid,
-          events: projectEvents(page),
+          events: projectEvents(page, liveSession !== undefined ? ctx.agents.get(liveSession.id) : undefined),
           hasMore: all.some((ev) => ev.seq < (page[0]?.seq ?? cmd.beforeSeq)),
           total: all.length,
         })
@@ -1454,44 +1456,91 @@ function truncateResult(text: string): string {
   return `${text.slice(0, TOOL_RESULT_MAX_CHARS)}\n…(已截断，共 ${text.length} 字符)`
 }
 
-function projectEvent(event: SessionEvent): EventProjection | null {
+function projectEvent(ctx: Context, event: SessionEvent, scope?: unknown): EventProjection[] {
   const base = { seq: event.seq, timestamp: event.time }
   switch (event.type) {
     case 'user/message': {
       const text = extractText(event.data.content)
-      if (!text) return null
-      return { ...base, type: 'user_message', text }
+      if (!text) return []
+      return [{ ...base, type: 'user_message', text }]
     }
     case 'assistant/message': {
-      const text = extractText(event.data.message.content)
-      if (!text) return null
-      return { ...base, type: 'assistant_message', text }
+      // Think（reasoning）步骤单独投影为一行，与桌面端一致；正文照常
+      const blocks = event.data.message.content as readonly ContentBlock[]
+      const out: EventProjection[] = []
+      for (const block of blocks) {
+        if (block.type !== 'reasoning') continue
+        const reasoning = (block as { text?: string }).text ?? ''
+        if (reasoning.trim() === '') continue
+        out.push({
+          ...base,
+          type: 'think',
+          // 一行浓缩：客户端单行展示，服务端裁剪到 240 字符
+          text: reasoning.length > 240 ? `${reasoning.slice(0, 240)}…` : reasoning,
+        })
+      }
+      const text = extractText(blocks)
+      if (text) out.push({ ...base, type: 'assistant_message', text })
+      return out
     }
     case 'tool/call': {
       const callId = (event.data as { callId?: unknown }).callId
-      return {
+      // 桌面端同款描述：presentCall 的 ToolCallView.title（Bash 即命令文本）
+      let toolCard: string | undefined
+      let toolDesc: string | undefined
+      let toolKind: string | undefined
+      try {
+        const raw = (event.data as { arguments?: unknown }).arguments
+        const args = typeof raw === 'string' ? JSON.parse(raw) : raw
+        const view = ctx.tools.get(String(event.data.name), scope as never)?.presentCall?.(args)
+        if (view !== undefined) {
+          toolCard = view.card
+          toolDesc = view.title
+          if ('kind' in view && view.kind !== undefined) toolKind = view.kind
+        }
+      } catch {
+        // presenter 失败：退回无描述（客户端用默认卡片）
+      }
+      // 兜底：没有 presenter 的 bash 类工具用命令文本当描述
+      if (toolDesc === undefined) {
+        try {
+          const raw = (event.data as { arguments?: unknown }).arguments
+          const args = typeof raw === 'string' ? JSON.parse(raw) : raw
+          const command = (args as { command?: unknown } | undefined)?.command
+          if (typeof command === 'string' && command.trim() !== '') {
+            toolDesc = command.trim()
+            toolCard = 'terminal'
+          }
+        } catch {
+          // 忽略
+        }
+      }
+      return [{
         ...base,
         type: 'tool_call',
         toolName: event.data.name,
         toolArgs: event.data.arguments,
         ...(callId !== undefined ? { callId: String(callId) } : {}),
-      }
+        ...(toolCard !== undefined ? { toolCard } : {}),
+        ...(toolDesc !== undefined ? { toolDesc } : {}),
+        ...(toolKind !== undefined ? { toolKind } : {}),
+      }]
     }
     case 'tool/result': {
       const data = event.data as { message?: { content?: readonly ContentBlock[] }; error?: unknown }
       const cid = (data.message?.content as readonly ({ toolCallId?: unknown } | null)[] | undefined)
         ?.find((b) => (b as { toolCallId?: unknown } | null)?.toolCallId !== undefined)
         ?.toolCallId
-      return {
+      return [{
         ...base,
         type: 'tool_result',
         toolResult: truncateResult(extractText(data.message?.content)),
         toolError: data.error !== undefined,
         ...(cid !== undefined ? { callId: String(cid) } : {}),
-      }
+      }]
     }
     default:
-      return null
+      return []
   }
 }
 

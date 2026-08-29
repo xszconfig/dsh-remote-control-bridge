@@ -29,7 +29,7 @@ export interface AgentSummary {
     status: AgentStatusWire;
     depth: number;
 }
-export type EventKind = 'user_message' | 'assistant_message' | 'tool_call' | 'tool_result' | 'error' | 'system';
+export type EventKind = 'user_message' | 'assistant_message' | 'tool_call' | 'tool_result' | 'think' | 'error' | 'system';
 export interface EventProjection {
     seq: number;
     type: EventKind;
@@ -41,6 +41,12 @@ export interface EventProjection {
     timestamp: number;
     /** 工具调用/结果关联 id：客户端据此把失败的命令标红。 */
     callId?: string;
+    /** 工具调用卡片形态（桌面端 presentCall 同源）：terminal=命令卡，generic/diff=通用卡。 */
+    toolCard?: string;
+    /** 工具调用的一行描述（桌面端 ToolCallView.title；Bash 即命令文本）。 */
+    toolDesc?: string;
+    /** 工具类别（read/edit/delete/move/search/execute/fetch/other），客户端选图标。 */
+    toolKind?: string;
 }
 export interface ApprovalRequestWire {
     approvalId: string;
