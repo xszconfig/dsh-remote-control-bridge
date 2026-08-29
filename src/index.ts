@@ -668,6 +668,9 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
       'rpcId' in cmd && typeof (cmd as { rpcId?: unknown }).rpcId === 'string'
         ? `rpc=${(cmd as { rpcId: string }).rpcId.slice(0, 8)}`
         : '',
+      cmd.type === 'send_message' && typeof (cmd as { text?: unknown }).text === 'string'
+        ? `text=${(cmd as { text: string }).text.slice(0, 40)}`
+        : '',
     ].filter(Boolean).join(' ')
     logger.debug('CMD', `收到命令 type=${cmd.type} ${extra}`)
 
