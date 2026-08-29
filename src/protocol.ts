@@ -140,6 +140,13 @@ export interface CmdAnswerQuestion {
 export interface CmdList {
   type: 'list'
 }
+/** 历史分页：拉取 seq < beforeSeq 的最近一页（最多 limit 条）。 */
+export interface CmdHistoryPage {
+  type: 'history_page'
+  sessionId: string
+  beforeSeq: number
+  limit?: number
+}
 /** 排队消息操作：steer = 插队（作为 steering 注入当前轮）；remove = 移除。 */
 export interface CmdQueueAction {
   type: 'queue_action'
@@ -180,6 +187,7 @@ export type ClientCommand =
   | CmdAnswerApproval
   | CmdAnswerQuestion
   | CmdList
+  | CmdHistoryPage
   | CmdQueueAction
   | CmdUploadLogs
   | CmdRegisterDevice
@@ -249,6 +257,10 @@ export interface EvHistory {
   events: EventProjection[]
   /** 该会话当前排队的消息（inbox 投影）；缺省 = 无排队。 */
   queue?: QueueItemWire[]
+  /** 是否还有更早的历史可翻页（history_page 继续加载）。 */
+  hasMore?: boolean
+  /** 会话事件总数（展示用）。 */
+  total?: number
 }
 /** 排队消息投影：placement = queued(下一轮)/steering(用户插队中)/context(系统注入)。 */
 export interface QueueItemWire {
@@ -354,4 +366,4 @@ export interface DeviceRecord {
   lastSeenAt: number
 }
 
-export const BRIDGE_VERSION = '0.9.0'
+export const BRIDGE_VERSION = '0.10.0'
