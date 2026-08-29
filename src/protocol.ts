@@ -285,6 +285,19 @@ export interface EvLogsRequest {
   type: 'logs_request'
   requestId: string
 }
+/** 该会话的模型请求开始（Deep Diving 指示）。 */
+export interface EvModelWaiting {
+  type: 'model_waiting'
+  sessionId: string
+  startedAt: number
+}
+/** 该会话的模型请求完成。 */
+export interface EvModelWaitingDone {
+  type: 'model_waiting_done'
+  sessionId: string
+  startedAt: number
+  elapsedMs: number
+}
 /** A session's durable title changed (user rename or automatic generation). */
 export interface EvSessionTitle {
   type: 'session_title'
@@ -328,6 +341,8 @@ export type ServerEvent =
   | EvHistory
   | EvSessionQueue
   | EvLogsRequest
+  | EvModelWaiting
+  | EvModelWaitingDone
   | EvSessionTitle
   | EvSessionUpsert
   | EvAgentStatus
@@ -373,4 +388,4 @@ export interface DeviceRecord {
   lastSeenAt: number
 }
 
-export const BRIDGE_VERSION = '0.10.1'
+export const BRIDGE_VERSION = '0.10.2'

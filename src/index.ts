@@ -375,6 +375,23 @@ export function apply(ctx: Context) {
     })),
   ]
 
+  // ---- Deep Diving：模型请求起止 → 手机指示条 ----
+  ctx.on('llm/stream', (options, next) => {
+    const sessionId = options.sessionId
+    if (sessionId === undefined) return next()
+    const startedAt = Date.now()
+    const sid = String(sessionId)
+    broadcast({ type: 'model_waiting', sessionId: sid, startedAt })
+    const stream = next()
+    return (async function* () {
+      try {
+        for await (const chunk of stream) yield chunk
+      } finally {
+        broadcast({ type: 'model_waiting_done', sessionId: sid, startedAt, elapsedMs: Date.now() - startedAt })
+      }
+    })()
+  }, { global: true, prepend: true })
+
   // ---- live event fan-out ----
   ctx.on('session/event', (session, event) => {
     if (event.type === 'session/title') {

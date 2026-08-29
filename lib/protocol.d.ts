@@ -247,6 +247,19 @@ export interface EvLogsRequest {
     type: 'logs_request';
     requestId: string;
 }
+/** 该会话的模型请求开始（Deep Diving 指示）。 */
+export interface EvModelWaiting {
+    type: 'model_waiting';
+    sessionId: string;
+    startedAt: number;
+}
+/** 该会话的模型请求完成。 */
+export interface EvModelWaitingDone {
+    type: 'model_waiting_done';
+    sessionId: string;
+    startedAt: number;
+    elapsedMs: number;
+}
 /** A session's durable title changed (user rename or automatic generation). */
 export interface EvSessionTitle {
     type: 'session_title';
@@ -281,7 +294,7 @@ export interface EvDeviceRevoked {
     type: 'device_revoked';
     deviceId: string;
 }
-export type ServerEvent = EvHello | EvSessions | EvAgents | EvEvent | EvHistory | EvSessionQueue | EvLogsRequest | EvSessionTitle | EvSessionUpsert | EvAgentStatus | EvApprovalRequest | EvApprovalResolved | EvQuestionRequest | EvQuestionResolved | EvError | EvDeviceRegistered | EvDeviceRevoked;
+export type ServerEvent = EvHello | EvSessions | EvAgents | EvEvent | EvHistory | EvSessionQueue | EvLogsRequest | EvModelWaiting | EvModelWaitingDone | EvSessionTitle | EvSessionUpsert | EvAgentStatus | EvApprovalRequest | EvApprovalResolved | EvQuestionRequest | EvQuestionResolved | EvError | EvDeviceRegistered | EvDeviceRevoked;
 export interface PingInfo {
     ok: true;
     version: string;
@@ -310,4 +323,4 @@ export interface DeviceRecord {
     createdAt: number;
     lastSeenAt: number;
 }
-export declare const BRIDGE_VERSION = "0.10.1";
+export declare const BRIDGE_VERSION = "0.10.2";
