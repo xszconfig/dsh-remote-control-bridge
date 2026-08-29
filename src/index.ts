@@ -191,6 +191,8 @@ export function apply(ctx: Context) {
         (x) => String(x.session.header.parentSession) === id && isSubagent(x),
       ).length,
       updatedAt: lastEventTime(s),
+      // 子代理会话：挂在主会话下，客户端不列入顶层会话列表
+      ...(s.header.parentSession !== undefined ? { parentSessionId: String(s.header.parentSession) } : {}),
     }
   }
 
@@ -231,6 +233,8 @@ export function apply(ctx: Context) {
       agentCount: 0,
       subagentCount: 0,
       updatedAt: Math.max(h.createdAt, lastPromptAt ?? 0),
+      // 子代理会话：挂在主会话下，客户端不列入顶层会话列表
+      ...(h.parentSession !== undefined ? { parentSessionId: String(h.parentSession) } : {}),
     }
   }
 

@@ -18,6 +18,8 @@ export interface SessionSummary {
   agentCount: number
   subagentCount: number
   updatedAt: number
+  /** 子代理会话所属的主会话 id；缺省 = 顶层（用户手动创建的）会话。 */
+  parentSessionId?: string
 }
 
 export interface WorkspaceSummary {
@@ -309,4 +311,4 @@ export interface DeviceRecord {
   lastSeenAt: number
 }
 
-export const BRIDGE_VERSION = '0.6.1'
+export const BRIDGE_VERSION = '0.7.0'
