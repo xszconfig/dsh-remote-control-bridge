@@ -145,6 +145,18 @@ export interface CmdQueueAction {
   itemId: string
   action: 'steer' | 'remove'
 }
+/** 手机回传本地结构化连接日志（桌面端 /remote/phone-logs 拉取）。 */
+export interface LogEntryWire {
+  ts: number
+  level: string
+  tag: string
+  message: string
+}
+export interface CmdUploadLogs {
+  type: 'upload_logs'
+  requestId: string
+  entries: LogEntryWire[]
+}
 /** Pair a phone with the desktop: exchange a long-lived per-device token. */
 export interface CmdRegisterDevice {
   type: 'register_device'
@@ -167,6 +179,7 @@ export type ClientCommand =
   | CmdAnswerQuestion
   | CmdList
   | CmdQueueAction
+  | CmdUploadLogs
   | CmdRegisterDevice
   | CmdRevokeDevice
 
@@ -246,6 +259,11 @@ export interface EvSessionQueue {
   sessionId: string
   items: QueueItemWire[]
 }
+/** 桌面端请求手机回传本地日志（经 /remote/phone-logs 触发）。 */
+export interface EvLogsRequest {
+  type: 'logs_request'
+  requestId: string
+}
 /** A session's durable title changed (user rename or automatic generation). */
 export interface EvSessionTitle {
   type: 'session_title'
@@ -288,6 +306,7 @@ export type ServerEvent =
   | EvEvent
   | EvHistory
   | EvSessionQueue
+  | EvLogsRequest
   | EvSessionTitle
   | EvSessionUpsert
   | EvAgentStatus
@@ -333,4 +352,4 @@ export interface DeviceRecord {
   lastSeenAt: number
 }
 
-export const BRIDGE_VERSION = '0.8.0'
+export const BRIDGE_VERSION = '0.9.0'

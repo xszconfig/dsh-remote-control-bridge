@@ -124,6 +124,18 @@ export interface CmdQueueAction {
     itemId: string;
     action: 'steer' | 'remove';
 }
+/** 手机回传本地结构化连接日志（桌面端 /remote/phone-logs 拉取）。 */
+export interface LogEntryWire {
+    ts: number;
+    level: string;
+    tag: string;
+    message: string;
+}
+export interface CmdUploadLogs {
+    type: 'upload_logs';
+    requestId: string;
+    entries: LogEntryWire[];
+}
 /** Pair a phone with the desktop: exchange a long-lived per-device token. */
 export interface CmdRegisterDevice {
     type: 'register_device';
@@ -136,7 +148,7 @@ export interface CmdRevokeDevice {
     type: 'revoke_device';
     deviceId: string;
 }
-export type ClientCommand = CmdSubscribe | CmdSendMessage | CmdInterrupt | CmdApprove | CmdAnswerApproval | CmdAnswerQuestion | CmdList | CmdQueueAction | CmdRegisterDevice | CmdRevokeDevice;
+export type ClientCommand = CmdSubscribe | CmdSendMessage | CmdInterrupt | CmdApprove | CmdAnswerApproval | CmdAnswerQuestion | CmdList | CmdQueueAction | CmdUploadLogs | CmdRegisterDevice | CmdRevokeDevice;
 export interface EvHello {
     type: 'hello';
     version: string;
@@ -211,6 +223,11 @@ export interface EvSessionQueue {
     sessionId: string;
     items: QueueItemWire[];
 }
+/** 桌面端请求手机回传本地日志（经 /remote/phone-logs 触发）。 */
+export interface EvLogsRequest {
+    type: 'logs_request';
+    requestId: string;
+}
 /** A session's durable title changed (user rename or automatic generation). */
 export interface EvSessionTitle {
     type: 'session_title';
@@ -245,7 +262,7 @@ export interface EvDeviceRevoked {
     type: 'device_revoked';
     deviceId: string;
 }
-export type ServerEvent = EvHello | EvSessions | EvAgents | EvEvent | EvHistory | EvSessionQueue | EvSessionTitle | EvSessionUpsert | EvAgentStatus | EvApprovalRequest | EvApprovalResolved | EvQuestionRequest | EvQuestionResolved | EvError | EvDeviceRegistered | EvDeviceRevoked;
+export type ServerEvent = EvHello | EvSessions | EvAgents | EvEvent | EvHistory | EvSessionQueue | EvLogsRequest | EvSessionTitle | EvSessionUpsert | EvAgentStatus | EvApprovalRequest | EvApprovalResolved | EvQuestionRequest | EvQuestionResolved | EvError | EvDeviceRegistered | EvDeviceRevoked;
 export interface PingInfo {
     ok: true;
     version: string;
@@ -274,4 +291,4 @@ export interface DeviceRecord {
     createdAt: number;
     lastSeenAt: number;
 }
-export declare const BRIDGE_VERSION = "0.8.0";
+export declare const BRIDGE_VERSION = "0.9.0";
