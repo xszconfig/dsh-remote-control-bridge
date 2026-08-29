@@ -298,6 +298,12 @@ export interface EvModelWaitingDone {
   startedAt: number
   elapsedMs: number
 }
+/** 思考流式增量（reasoning-delta 累积，节流广播；text 为空 = 清除实时思考行）。 */
+export interface EvThinkDelta {
+  type: 'think_delta'
+  sessionId: string
+  text: string
+}
 /** A session's durable title changed (user rename or automatic generation). */
 export interface EvSessionTitle {
   type: 'session_title'
@@ -343,6 +349,7 @@ export type ServerEvent =
   | EvLogsRequest
   | EvModelWaiting
   | EvModelWaitingDone
+  | EvThinkDelta
   | EvSessionTitle
   | EvSessionUpsert
   | EvAgentStatus
@@ -388,4 +395,4 @@ export interface DeviceRecord {
   lastSeenAt: number
 }
 
-export const BRIDGE_VERSION = '0.10.6'
+export const BRIDGE_VERSION = '0.10.7'

@@ -260,6 +260,12 @@ export interface EvModelWaitingDone {
     startedAt: number;
     elapsedMs: number;
 }
+/** 思考流式增量（reasoning-delta 累积，节流广播；text 为空 = 清除实时思考行）。 */
+export interface EvThinkDelta {
+    type: 'think_delta';
+    sessionId: string;
+    text: string;
+}
 /** A session's durable title changed (user rename or automatic generation). */
 export interface EvSessionTitle {
     type: 'session_title';
@@ -294,7 +300,7 @@ export interface EvDeviceRevoked {
     type: 'device_revoked';
     deviceId: string;
 }
-export type ServerEvent = EvHello | EvSessions | EvAgents | EvEvent | EvHistory | EvSessionQueue | EvLogsRequest | EvModelWaiting | EvModelWaitingDone | EvSessionTitle | EvSessionUpsert | EvAgentStatus | EvApprovalRequest | EvApprovalResolved | EvQuestionRequest | EvQuestionResolved | EvError | EvDeviceRegistered | EvDeviceRevoked;
+export type ServerEvent = EvHello | EvSessions | EvAgents | EvEvent | EvHistory | EvSessionQueue | EvLogsRequest | EvModelWaiting | EvModelWaitingDone | EvThinkDelta | EvSessionTitle | EvSessionUpsert | EvAgentStatus | EvApprovalRequest | EvApprovalResolved | EvQuestionRequest | EvQuestionResolved | EvError | EvDeviceRegistered | EvDeviceRevoked;
 export interface PingInfo {
     ok: true;
     version: string;
@@ -323,4 +329,4 @@ export interface DeviceRecord {
     createdAt: number;
     lastSeenAt: number;
 }
-export declare const BRIDGE_VERSION = "0.10.6";
+export declare const BRIDGE_VERSION = "0.10.7";

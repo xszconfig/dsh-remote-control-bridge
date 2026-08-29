@@ -111,6 +111,7 @@ export function apply(ctx: Context) {
   const clients = new Set<WebSocket>()
   let devices = loadDevices()
   const pairTokens = new Map<string, number>() // token -> expiry epoch ms
+  const thinkStreams = new Map<string, { text: string; timer?: NodeJS.Timeout }>() // sessionId -> 思考流累积
   const pairPrune = setInterval(() => {
     const now = Date.now()
     for (const [t, exp] of pairTokens) if (exp < now) pairTokens.delete(t)
@@ -401,6 +402,40 @@ export function apply(ctx: Context) {
         title: event.data.title,
       })
       return
+    }
+    // 思考流式：reasoning-delta 增量累积 → 节流广播 think_delta（手机端一行持续刷新，
+    // 与 DeepSeek Web 的 thinking 体验对齐；最终行仍由 assistant/message 投影发出）
+    if (event.type === 'assistant/chunk') {
+      const chunk = (event.data as { chunk?: { type?: string } }).chunk
+      if (chunk?.type === 'reasoning-delta') {
+        const delta = (chunk as { text?: string }).text ?? ''
+        if (delta) {
+          const sid = String(session.id)
+          let st = thinkStreams.get(sid)
+          if (st === undefined) {
+            st = { text: '' }
+            thinkStreams.set(sid, st)
+          }
+          st.text += delta
+          if (st.timer === undefined) {
+            st.timer = setTimeout(() => {
+              st.timer = undefined
+              broadcast({ type: 'think_delta', sessionId: sid, text: st.text.slice(-240) })
+            }, 250)
+            st.timer.unref?.()
+          }
+        }
+      }
+      return
+    }
+    // 思考流结束/轮次边界：冲刷并清除实时思考行（终态由投影事件呈现）
+    if (event.type === 'assistant/message' || event.type === 'turn/end' || event.type === 'turn/start' || event.type === 'user/message') {
+      const st = thinkStreams.get(String(session.id))
+      if (st !== undefined) {
+        if (st.timer !== undefined) clearTimeout(st.timer)
+        thinkStreams.delete(String(session.id))
+        broadcast({ type: 'think_delta', sessionId: String(session.id), text: '' })
+      }
     }
     // 排队队列变化（inbox splice）→ 推给手机
     if (event.type === 'agent/inbox/spliced') {
