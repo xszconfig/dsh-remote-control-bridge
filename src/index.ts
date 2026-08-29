@@ -658,12 +658,28 @@ export function apply(ctx: Context) {
         const rec = upsertDevice(cmd.deviceId, cmd.name, cmd.model)
         logger.info('DEVICE', `设备注册 device=${cmd.deviceId.slice(0, 8)} name=${cmd.name}${cmd.model ? ` model=${cmd.model}` : ''}`)
         wsAuth.set(ws, { kind: 'device', deviceId: rec.deviceId })
+        // 多路由候选端点：127.0.0.1（USB adb reverse）+ 全部局域网/Tailscale IPv4
+        const endpoints = (() => {
+          const seen = new Set<string>()
+          const list: { host: string; port: number }[] = []
+          const add = (h: string) => {
+            const key = `${h}:${ctx.webServer.port}`
+            if (seen.has(key)) return
+            seen.add(key)
+            list.push({ host: h, port: ctx.webServer.port })
+          }
+          add('127.0.0.1')
+          for (const ip of lanIpv4s()) add(ip)
+          return list
+        })()
+        logger.info('DEVICE', `下发候选端点: ${endpoints.map((e) => `${e.host}:${e.port}`).join(', ')}`)
         send(ws, {
           type: 'device_registered',
           deviceId: rec.deviceId,
           deviceToken: rec.token,
           serverId,
           hostname: host,
+          endpoints,
         })
         break
       }

@@ -201,12 +201,18 @@ export interface EvError {
     message: string;
 }
 /** Answer to register_device: the phone stores this token for reconnects. */
+export interface WireEndpoint {
+    host: string;
+    port: number;
+}
 export interface EvDeviceRegistered {
     type: 'device_registered';
     deviceId: string;
     deviceToken: string;
     serverId: string;
     hostname: string;
+    /** 手机可达的候选端点（127.0.0.1 + 局域网/Tailscale IP，供多路由重连）。 */
+    endpoints: WireEndpoint[];
 }
 export interface EvDeviceRevoked {
     type: 'device_revoked';
