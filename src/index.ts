@@ -421,7 +421,7 @@ export function apply(ctx: Context) {
             st.timer = setTimeout(() => {
               st.timer = undefined
               broadcast({ type: 'think_delta', sessionId: sid, text: st.text.slice(-240) })
-            }, 250)
+            }, 100) // 思考流节流 100ms（用户要求，更跟手）
             st.timer.unref?.()
           }
         }
