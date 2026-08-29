@@ -386,9 +386,18 @@ export function apply(ctx: Context) {
     }
     // 排队队列变化（inbox splice）→ 推给手机
     if (event.type === 'agent/inbox/spliced') {
-      const agent = ctx.agents.get(session.id)
-      if (agent?.session === session) {
-        broadcast({ type: 'session_queue', sessionId: String(session.id), items: queueItemsOf(agent) })
+      try {
+        const agent = ctx.agents.get(session.id)
+        const identity = agent?.session === session
+        logger.debug('QUEUE', `inbox/spliced session=${String(session.id).slice(0, 12)} agent=${agent === undefined ? 'no' : 'yes'} identity=${identity}`)
+        if (identity && agent !== undefined) {
+          const items = queueItemsOf(agent)
+          logger.debug('QUEUE', `session_queue 广播 session=${String(session.id).slice(0, 12)} items=${items.length}`)
+          broadcast({ type: 'session_queue', sessionId: String(session.id), items })
+        }
+      } catch (e: unknown) {
+        // 队列投影失败绝不能吞掉后续事件处理
+        logger.warn('QUEUE', `inbox/spliced 处理失败: ${String(e)}`)
       }
       return
     }
