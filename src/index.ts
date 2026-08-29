@@ -12,7 +12,8 @@ import { createUserMessage, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import { SessionId, type Session, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
 import type { WebRoute, WebUpgradeRoute } from '@deepseek-ai/dsh-host-webserver'
 import { setApprovalPolicy } from '@deepseek-ai/dsh-user-approval'
-import { foldSessionTitle } from '@deepseek-ai/dsh-session-title'
+import type { SessionProjectionCache } from '@deepseek-ai/dsh-session-projection-cache'
+import type {} from '@deepseek-ai/dsh-session-title'
 import type {} from '@deepseek-ai/dsh-workspace'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 
@@ -144,6 +145,10 @@ export function apply(ctx: Context) {
   const agentOf = (sessionId: string): Agent | undefined =>
     allAgents().find((a) => String(a.id) === sessionId)
 
+  /** 投影缓存服务（软依赖：headless 部署可缺省，降级 header 信息）。 */
+  const projectionCache = (): SessionProjectionCache | undefined =>
+    ctx.get('sessionProjectionCache') as SessionProjectionCache | undefined
+
   /** Desktop display title: durable title, cwd basename, then id. */
   const displayTitleOf = (s: Session): string => {
     const title = ctx.sessionTitle.get(s)?.title
@@ -189,20 +194,44 @@ export function apply(ctx: Context) {
     }
   }
 
-  /** 冷会话（已持久化、未加载）的标题回退：日志折叠 → cwd basename → id。 */
-  const coldTitleOf = (h: SessionHeader, events: SessionEvent[]): string => {
-    try {
-      const title = foldSessionTitle(events)?.title
-      if (title) return title
-    } catch {
-      // 折叠失败按回退处理
-    }
+  /** 冷会话标题回退（无投影缓存行时）：cwd basename → id。 */
+  const coldFallbackTitle = (h: SessionHeader): string => {
     const cwd = h.cwd
     if (cwd) {
       const base = cwd.replace(/[/\\]+$/, '').split(/[/\\]/).pop()
       if (base) return base
     }
     return String(h.id)
+  }
+
+  /**
+   * 冷会话行：投影缓存零日志读取（title / sessionListMetadata 检查点），
+   * 与桌面端 session.list 同源；失败降级为 header 信息，绝不读全量日志
+   * （大日志的同步 JSON 解析会阻塞事件循环，曾导致整个服务卡死）。
+   */
+  const coldRowFromCache = (h: SessionHeader): SessionSummary => {
+    let title: string | undefined
+    let lastPromptAt: number | null = null
+    try {
+      const snap = projectionCache()?.cachedSnapshot(h)
+      const values = snap?.values as Record<string, unknown> | undefined
+      const titleVal = values?.['title']
+      if (typeof titleVal === 'string' && titleVal.length > 0) title = titleVal
+      const meta = values?.['sessionListMetadata'] as { blank?: boolean; lastPromptAt?: number | null } | undefined
+      if (typeof meta?.lastPromptAt === 'number') lastPromptAt = meta.lastPromptAt
+    } catch (e: unknown) {
+      logger.warn('SESSION', `冷会话 ${String(h.id)} 投影缓存读取失败（降级 header）: ${String(e)}`)
+    }
+    return {
+      id: String(h.id),
+      name: title ?? coldFallbackTitle(h),
+      cwd: h.cwd ?? '',
+      workspaceId: workspaceIdOf(String(h.id)),
+      status: 'idle',
+      agentCount: 0,
+      subagentCount: 0,
+      updatedAt: Math.max(h.createdAt, lastPromptAt ?? 0),
+    }
   }
 
   /**
@@ -233,32 +262,10 @@ export function apply(ctx: Context) {
         live.delete(id)
         continue
       }
-      // 冷会话：读日志折叠标题与更新时间（只读，不拉起 agent）
-      try {
-        const { events } = await persistence.readFrom(h.id, 0)
-        rows.push({
-          id,
-          name: coldTitleOf(h, events),
-          cwd: h.cwd ?? '',
-          workspaceId: workspaceIdOf(id),
-          status: 'idle',
-          agentCount: 0,
-          subagentCount: 0,
-          updatedAt: events.length > 0 ? events[events.length - 1].time : h.createdAt,
-        })
-      } catch (e: unknown) {
-        logger.warn('SESSION', `冷会话 ${id} 读取失败（仅 header）: ${String(e)}`)
-        rows.push({
-          id,
-          name: coldTitleOf(h, []),
-          cwd: h.cwd ?? '',
-          workspaceId: workspaceIdOf(id),
-          status: 'idle',
-          agentCount: 0,
-          subagentCount: 0,
-          updatedAt: h.createdAt,
-        })
-      }
+      // 冷会话：零日志读取——投影缓存（title / sessionListMetadata 检查点）
+      // 与桌面端 session.list 同源。绝不全量读日志：大日志的同步 JSON 解析
+      // 会阻塞事件循环（曾导致整个服务卡死）。
+      rows.push(coldRowFromCache(h))
     }
     for (const ls of live.values()) rows.push(sessionRowFromLive(ls))
     rows.sort((a, b) => b.updatedAt - a.updatedAt)
