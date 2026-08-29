@@ -404,19 +404,25 @@ export function apply(ctx: Context) {
     }
     // 排队队列变化（inbox splice）→ 推给手机
     if (event.type === 'agent/inbox/spliced') {
-      try {
-        const agent = ctx.agents.get(session.id)
-        const identity = agent?.session === session
-        logger.debug('QUEUE', `inbox/spliced session=${String(session.id).slice(0, 12)} agent=${agent === undefined ? 'no' : 'yes'} identity=${identity}`)
-        if (identity && agent !== undefined) {
-          const items = queueItemsOf(agent)
-          logger.debug('QUEUE', `session_queue 广播 session=${String(session.id).slice(0, 12)} items=${items.length}`)
-          broadcast({ type: 'session_queue', sessionId: String(session.id), items })
+      // inbox.mutate 先 session.append 落库、后改内存投影，且 session/event 观察者
+      // 是同步触发的：此刻读 agent.inbox 拿到的是"变更前"队列（滞后一拍）。
+      // 必须延迟到本 tick 结束（投影已更新）再广播，否则手机端队列状态永远错位：
+      // 入队广播不含新消息（乐观项被冲掉）、claim 广播仍含旧消息（永远显示排队）。
+      queueMicrotask(() => {
+        try {
+          const agent = ctx.agents.get(session.id)
+          const identity = agent?.session === session
+          logger.debug('QUEUE', `inbox/spliced(deferred) session=${String(session.id).slice(0, 12)} agent=${agent === undefined ? 'no' : 'yes'} identity=${identity}`)
+          if (identity && agent !== undefined) {
+            const items = queueItemsOf(agent)
+            logger.debug('QUEUE', `session_queue 广播 session=${String(session.id).slice(0, 12)} items=${items.length}`)
+            broadcast({ type: 'session_queue', sessionId: String(session.id), items })
+          }
+        } catch (e: unknown) {
+          // 队列投影失败绝不能吞掉后续事件处理
+          logger.warn('QUEUE', `inbox/spliced 延迟广播失败: ${String(e)}`)
         }
-      } catch (e: unknown) {
-        // 队列投影失败绝不能吞掉后续事件处理
-        logger.warn('QUEUE', `inbox/spliced 处理失败: ${String(e)}`)
-      }
+      })
       return
     }
     const scope = ctx.agents.get(session.id)
