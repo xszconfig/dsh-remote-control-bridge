@@ -24,6 +24,7 @@ import {
   type ApprovalRequestWire,
   type ClientCommand,
   type DeviceRecord,
+  type DiffWire,
   type EventProjection,
   type EvHello,
   type LogEntryWire,
@@ -1577,6 +1578,7 @@ function projectEvent(ctx: Context, event: SessionEvent, scope?: unknown): Event
       let toolCard: string | undefined
       let toolDesc: string | undefined
       let toolKind: string | undefined
+      let toolDiffs: DiffWire[] | undefined
       try {
         const raw = (event.data as { arguments?: unknown }).arguments
         const args = typeof raw === 'string' ? JSON.parse(raw) : raw
@@ -1588,6 +1590,23 @@ function projectEvent(ctx: Context, event: SessionEvent, scope?: unknown): Event
           const desc = (view as { description?: unknown }).description
           toolDesc = typeof desc === 'string' && desc.trim() !== '' ? desc : view.title
           if ('kind' in view && view.kind !== undefined) toolKind = view.kind
+          // DiffCallView（edit/write 等）：把 diffs 一并下发，客户端展开工具卡渲染红删绿增
+          const rawDiffs = (view as { diffs?: unknown }).diffs
+          if (Array.isArray(rawDiffs)) {
+            toolDiffs = rawDiffs
+              .map((d): DiffWire | null => {
+                const o = d as { path?: unknown; oldText?: unknown; newText?: unknown }
+                if (o === null || typeof o !== 'object') return null
+                if (typeof o.newText !== 'string') return null
+                return {
+                  path: typeof o.path === 'string' ? o.path : '',
+                  oldText: typeof o.oldText === 'string' ? o.oldText : null,
+                  newText: o.newText,
+                }
+              })
+              .filter((d): d is DiffWire => d !== null)
+              .slice(0, 20) // 单条工具卡 diff 上限保护
+          }
         }
       } catch {
         // presenter 失败：退回无描述（客户端用默认卡片）
@@ -1615,6 +1634,7 @@ function projectEvent(ctx: Context, event: SessionEvent, scope?: unknown): Event
         ...(toolCard !== undefined ? { toolCard } : {}),
         ...(toolDesc !== undefined ? { toolDesc } : {}),
         ...(toolKind !== undefined ? { toolKind } : {}),
+        ...(toolDiffs !== undefined ? { diffs: toolDiffs } : {}),
       }]
     }
     case 'tool/result': {

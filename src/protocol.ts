@@ -62,6 +62,16 @@ export interface EventProjection {
   toolDesc?: string
   /** 工具类别（read/edit/delete/move/search/execute/fetch/other），客户端选图标。 */
   toolKind?: string
+  /** 文件变更 diff（桌面端 DiffCallView.diffs 同源）：客户端展开工具卡时按行渲染红删绿增。 */
+  diffs?: DiffWire[]
+}
+
+/** 单文件 diff（写/编辑工具 call-time presenter 从参数推导）。 */
+export interface DiffWire {
+  path: string
+  /** 旧文本；新建/覆盖为 null（全新增）。 */
+  oldText: string | null
+  newText: string
 }
 
 export interface ApprovalRequestWire {
@@ -395,4 +405,4 @@ export interface DeviceRecord {
   lastSeenAt: number
 }
 
-export const BRIDGE_VERSION = '0.10.8'
+export const BRIDGE_VERSION = '0.10.9'
