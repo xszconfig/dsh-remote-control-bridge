@@ -841,15 +841,15 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
         const liveSession = ctx.sessions.list().find((x) => String(x.id) === cmd.sessionId)
         if (liveSession) {
           const all = liveSession.events
-          const history = projectEvents(all.slice(-HISTORY_TAIL), ctx.agents.get(liveSession.id))
-          const agent = ctx.agents.get(liveSession.id)
+          const scope = ctx.agents.get(liveSession.id)
+          const { events, hasMore } = projectWindowBack(ctx, all, undefined, HISTORY_TAIL, scope)
           send(ws, {
             type: 'history',
             sessionId: String(liveSession.id),
-            events: history,
-            hasMore: all.length > HISTORY_TAIL,
+            events,
+            hasMore,
             total: all.length,
-            ...(agent?.session === liveSession ? { queue: queueItemsOf(agent) } : {}),
+            ...(scope?.session === liveSession ? { queue: queueItemsOf(scope) } : {}),
           })
           break
         }
@@ -857,13 +857,13 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
         try {
           if (!ctx.sessionPersistence) throw new Error('no sessionPersistence service')
           const all = await coldSessionEvents(cmd.sessionId)
-          const history = projectEvents(all.slice(-HISTORY_TAIL))
-          logger.info('WS', `冷会话历史 session=${cmd.sessionId.slice(0, 12)} events=${all.length}（下发尾部 ${history.length}）`)
+          const { events, hasMore } = projectWindowBack(ctx, all, undefined, HISTORY_TAIL)
+          logger.info('WS', `冷会话历史 session=${cmd.sessionId.slice(0, 12)} events=${all.length}（下发尾部 ${events.length}）`)
           send(ws, {
             type: 'history',
             sessionId: cmd.sessionId,
-            events: history,
-            hasMore: all.length > HISTORY_TAIL,
+            events,
+            hasMore,
             total: all.length,
           })
         } catch (e) {
@@ -872,19 +872,21 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
         break
       }
       case 'history_page': {
-        // 历史分页：seq < beforeSeq 的最近一页（limit 默认 300，上限 500）
+        // 历史分页：按"投影后的可见行"翻页——向前扫描原始事件逐条投影，
+        // 攒满一页可见行或扫到最开头（原始事件窗口翻页会整页投影为空，客户端卡死）。
         const sid = cmd.sessionId
         const limit = Math.min(Math.max(cmd.limit ?? 300, 10), 500)
         const liveSession = ctx.sessions.list().find((x) => String(x.id) === sid)
         const all = liveSession !== undefined
           ? liveSession.events
           : await coldSessionEvents(sid).catch(() => [])
-        const page = all.filter((ev) => ev.seq < cmd.beforeSeq).slice(-limit)
+        const scope = liveSession !== undefined ? ctx.agents.get(liveSession.id) : undefined
+        const { events, hasMore } = projectWindowBack(ctx, all, cmd.beforeSeq, limit, scope)
         send(ws, {
           type: 'history',
           sessionId: sid,
-          events: projectEvents(page, liveSession !== undefined ? ctx.agents.get(liveSession.id) : undefined),
-          hasMore: all.some((ev) => ev.seq < (page[0]?.seq ?? cmd.beforeSeq)),
+          events,
+          hasMore,
           total: all.length,
         })
         break
@@ -1479,6 +1481,32 @@ function truncateResult(text: string): string {
   return `${text.slice(0, TOOL_RESULT_MAX_CHARS)}\n…(已截断，共 ${text.length} 字符)`
 }
 
+/**
+ * 按"投影后的可见行"取窗口：从 seq < beforeSeq（undefined = 最尾部）向前扫描原始事件，
+ * 逐条投影、攒满 limit 行或扫到最开头。单个原始事件的多行投影原子收集（think+正文同 seq）。
+ * hasMore：攒满 limit 且仍有未扫描的原始事件时为 true（剩余可能全不可投影，
+ * 下一请求会空页返回并置 false，不会死循环）。
+ */
+function projectWindowBack(
+  ctx: Context,
+  all: readonly SessionEvent[],
+  beforeSeq: number | undefined,
+  limit: number,
+  scope?: unknown,
+): { events: EventProjection[]; hasMore: boolean } {
+  const events: EventProjection[] = []
+  let idx = all.length - 1
+  if (beforeSeq !== undefined) {
+    while (idx >= 0 && all[idx].seq >= beforeSeq) idx--
+  }
+  while (idx >= 0) {
+    events.push(...projectEvent(ctx, all[idx], scope))
+    idx--
+    if (events.length >= limit) break
+  }
+  return { events, hasMore: events.length >= limit && idx >= 0 }
+}
+
 function projectEvent(ctx: Context, event: SessionEvent, scope?: unknown): EventProjection[] {
   const base = { seq: event.seq, timestamp: event.time }
   switch (event.type) {
@@ -1518,7 +1546,10 @@ function projectEvent(ctx: Context, event: SessionEvent, scope?: unknown): Event
         const view = ctx.tools.get(String(event.data.name), scope as never)?.presentCall?.(args)
         if (view !== undefined) {
           toolCard = view.card
-          toolDesc = view.title
+          // 用户要求：优先展示 description（命令的一句话总结）；TerminalCallView 的
+          // title 是命令本身，description 才是人话总结。没有 description 时退回 title。
+          const desc = (view as { description?: unknown }).description
+          toolDesc = typeof desc === 'string' && desc.trim() !== '' ? desc : view.title
           if ('kind' in view && view.kind !== undefined) toolKind = view.kind
         }
       } catch {

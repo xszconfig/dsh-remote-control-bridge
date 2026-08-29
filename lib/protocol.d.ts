@@ -323,4 +323,4 @@ export interface DeviceRecord {
     createdAt: number;
     lastSeenAt: number;
 }
-export declare const BRIDGE_VERSION = "0.10.2";
+export declare const BRIDGE_VERSION = "0.10.5";
