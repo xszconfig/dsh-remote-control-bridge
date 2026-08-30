@@ -440,7 +440,18 @@ export class DebugManager {
     const program = opts.program.trim()
     if (program.length === 0) throw new Error('program 不能为空')
     const cwd = opts.cwd ?? process.cwd()
-    const session = new InspectorSession(this.hooks, sessionId, program, cwd, opts.breakpoints ?? [])
+    // 会话自然结束（进程退出/失败）后从注册表移除：否则永远无法对该会话再次启动调试
+    // （stop() 路径会 delete，但自然退出路径此前漏了，导致"已有调试进程在运行"卡死）
+    const hooks: DebugHooks = {
+      ...this.hooks,
+      onState: (sid, snap) => {
+        if (snap.state === 'stopped' && this.sessions.get(sid) !== undefined) {
+          this.sessions.delete(sid)
+        }
+        this.hooks.onState(sid, snap)
+      },
+    }
+    const session = new InspectorSession(hooks, sessionId, program, cwd, opts.breakpoints ?? [])
     this.sessions.set(sessionId, session)
     logger.info('DEBUG', `启动调试 session=${sessionId.slice(0, 12)} program=${program} breakpoints=${(opts.breakpoints ?? []).length}`)
     session.start()
