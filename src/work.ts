@@ -28,6 +28,10 @@ export interface WorkState {
   pending: string[]
   /** 最近一次重启的新增功能说明（推送给重连客户端展示）。 */
   notes: string[]
+  /** 待办所属会话（写入方记录；自动续跑优先唤醒该会话的 agent）。 */
+  sessionId?: string
+  /** 已注入过的待办指纹（activity+pending+sessionId）；文件内容未变不重复注入。 */
+  resumeFingerprint?: string
   /** 会话排队消息快照：sessionId → 快照（重启后与活队列对比，丢了才恢复）。 */
   queues?: Record<string, QueueSnapshot>
   updatedAt: number
@@ -65,6 +69,8 @@ export function loadWorkState(file: string): WorkState | null {
       activity: typeof parsed.activity === 'string' ? parsed.activity : null,
       pending: Array.isArray(parsed.pending) ? parsed.pending.filter((p): p is string => typeof p === 'string') : [],
       notes: Array.isArray(parsed.notes) ? parsed.notes.filter((p): p is string => typeof p === 'string') : [],
+      ...(typeof parsed.sessionId === 'string' ? { sessionId: parsed.sessionId } : {}),
+      ...(typeof parsed.resumeFingerprint === 'string' ? { resumeFingerprint: parsed.resumeFingerprint } : {}),
       ...(parsed.queues !== undefined ? { queues: parseQueues(parsed.queues) } : {}),
       updatedAt: typeof parsed.updatedAt === 'number' ? parsed.updatedAt : 0,
     }
@@ -79,6 +85,8 @@ export function writeWorkState(
     activity?: string | null
     pending?: string[]
     notes?: string[]
+    sessionId?: string
+    resumeFingerprint?: string
     queues?: Record<string, QueueSnapshot>
   },
 ): WorkState {
@@ -87,6 +95,12 @@ export function writeWorkState(
     activity: patch.activity !== undefined ? patch.activity : current.activity,
     pending: patch.pending !== undefined ? patch.pending : current.pending,
     notes: patch.notes !== undefined ? patch.notes : current.notes,
+    ...(patch.sessionId !== undefined || current.sessionId !== undefined
+      ? { sessionId: patch.sessionId !== undefined ? patch.sessionId : current.sessionId }
+      : {}),
+    ...(patch.resumeFingerprint !== undefined || current.resumeFingerprint !== undefined
+      ? { resumeFingerprint: patch.resumeFingerprint !== undefined ? patch.resumeFingerprint : current.resumeFingerprint }
+      : {}),
     ...((patch.queues !== undefined || current.queues !== undefined)
       ? { queues: patch.queues !== undefined ? patch.queues : current.queues }
       : {}),
