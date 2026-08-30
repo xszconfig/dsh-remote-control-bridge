@@ -284,6 +284,8 @@ export interface EvHistory {
   total?: number
   /** 该会话正在进行的模型请求开始时间（null = 未在等待）；切会话后指示条不串扰。 */
   modelWaitingSince?: number | null
+  /** 该会话当前持久化目标（null = 无目标）；会话级状态，切换会话不串扰。 */
+  goal?: GoalWire | null
 }
 /** 排队消息投影：placement = queued(下一轮)/steering(用户插队中)/context(系统注入)。 */
 export interface QueueItemWire {
@@ -337,6 +339,22 @@ export interface LspDiagnosticWire {
   severity: 1 | 2 | 3 | 4
   message: string
   source?: string
+}
+/** 会话持久化目标（goal/change 事件投影）：objective + 阶段 + 轮次 + 阻塞原因。 */
+export interface GoalWire {
+  objective: string
+  phase: 'active' | 'paused' | 'blocked' | 'complete'
+  blockedCode?: string
+  blockedMessage?: string
+  maxGoalRounds: number
+  roundsStarted: number
+  updatedAt: number
+}
+/** 目标变更推送：goal/change 落库后重读该会话目标广播（goal = null 表示已清除）。 */
+export interface EvGoalUpdate {
+  type: 'goal_update'
+  sessionId: string
+  goal: GoalWire | null
 }
 /** 服务端重启通知：客户端重连后推送（版本 + 启动时间 + 新增功能说明）。 */
 export interface EvServerBoot {
@@ -392,6 +410,7 @@ export type ServerEvent =
   | EvModelWaitingDone
   | EvThinkDelta
   | EvDiagnostics
+  | EvGoalUpdate
   | EvServerBoot
   | EvSessionTitle
   | EvSessionUpsert
@@ -438,4 +457,4 @@ export interface DeviceRecord {
   lastSeenAt: number
 }
 
-export const BRIDGE_VERSION = '0.11.5'
+export const BRIDGE_VERSION = '0.11.6'

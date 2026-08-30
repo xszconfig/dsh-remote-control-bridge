@@ -28,6 +28,7 @@ import {
   type DeviceRecord,
   type DiffWire,
   type EventProjection,  type EvHello,
+  type GoalWire,
   type LogEntryWire,
   type PairInfo,
   type QuestionRequestWire,
@@ -194,6 +195,66 @@ export function apply(ctx: Context) {
   /** 投影缓存服务（软依赖：headless 部署可缺省，降级 header 信息）。 */
   const projectionCache = (): SessionProjectionCache | undefined =>
     ctx.get('sessionProjectionCache') as SessionProjectionCache | undefined
+
+  /** dsh-goal 软类型（bridge 编译面不含 dsh-goal 包；运行时 ctx.goals 由 profile 提供）。 */
+  interface GoalViewLike {
+    objective: string
+    phase: 'active' | 'paused' | 'blocked' | 'complete'
+    blockedReason?: { code?: string; message?: string }
+    maxGoalRounds: number
+    roundsStarted: number
+    updatedAt: number
+  }
+  interface GoalProjectionLike {
+    goal?: {
+      objective: string
+      phase: 'active' | 'paused' | 'blocked' | 'complete'
+      blockedReason?: { code?: string; message?: string }
+      maxGoalRounds: number
+    } | null
+    roundsStarted?: number
+    updatedAt?: number
+  }
+  const goalWireFromView = (v: GoalViewLike): GoalWire => ({
+    objective: v.objective,
+    phase: v.phase,
+    blockedCode: v.blockedReason?.code,
+    blockedMessage: v.blockedReason?.message,
+    maxGoalRounds: v.maxGoalRounds,
+    roundsStarted: v.roundsStarted,
+    updatedAt: v.updatedAt,
+  })
+  const goalWireFromProjection = (p: GoalProjectionLike | null | undefined): GoalWire | null => {
+    const g = p?.goal
+    if (g === null || g === undefined) return null
+    return {
+      objective: g.objective,
+      phase: g.phase,
+      blockedCode: g.blockedReason?.code,
+      blockedMessage: g.blockedReason?.message,
+      maxGoalRounds: g.maxGoalRounds,
+      roundsStarted: p?.roundsStarted ?? 0,
+      updatedAt: p?.updatedAt ?? 0,
+    }
+  }
+  /** 活会话目标：ctx.goals.get(agent)（GoalView，含轮次）；失败/无 agent 回退 goal 投影快照。 */
+  const goalWireOf = (sessionId: string): GoalWire | null => {
+    try {
+      const session = ctx.sessions.list().find((s) => String(s.id) === sessionId)
+      if (session === undefined) return null
+      const goals = (ctx as unknown as { goals?: { get(agent: unknown): GoalViewLike | undefined } }).goals
+      const agent = ctx.agents.get(session.id)
+      const view = agent !== undefined ? goals?.get(agent) : undefined
+      if (view !== undefined) return goalWireFromView(view)
+      const proj = (ctx as unknown as {
+        sessionProjections?: { snapshot(s: unknown): { values: Record<string, unknown> } }
+      }).sessionProjections?.snapshot(session)
+      return goalWireFromProjection(proj?.values?.['goal'] as GoalProjectionLike | null | undefined)
+    } catch (e: unknown) {
+      logger.warn('GOAL', `读取会话 ${sessionId.slice(0, 12)} 目标失败（降级隐藏）: ${String(e)}`)
+      return null
+    }
+  }
 
   /** Desktop display title: durable title, cwd basename, then id. */
   const displayTitleOf = (s: Session): string => {
@@ -517,6 +578,18 @@ export function apply(ctx: Context) {
         } catch (e: unknown) {
           // 队列投影失败绝不能吞掉后续事件处理
           logger.warn('QUEUE', `inbox/spliced 延迟广播失败: ${String(e)}`)
+        }
+      })
+      return
+    }
+    // 目标变更（goal/change 落库）：延迟到本 tick 末重读该会话目标并广播（GoalService 视图
+    // 在事件提交后更新；与队列同款延迟，保证手机端拿到的是落库后的状态）。会话级，不串扰。
+    if ((event.type as string) === 'goal/change') {
+      queueMicrotask(() => {
+        try {
+          broadcast({ type: 'goal_update', sessionId: String(session.id), goal: goalWireOf(String(session.id)) })
+        } catch (e: unknown) {
+          logger.warn('GOAL', `goal/change 延迟广播失败 session=${String(session.id).slice(0, 12)}: ${String(e)}`)
         }
       })
       return
@@ -952,6 +1025,8 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
             // 该会话正在等模型 → 切进来立刻显示 Deep Diving（会话级状态，不串扰）
             modelWaitingSince: modelStreams.get(String(liveSession.id)) ?? null,
             ...(scope?.session === liveSession ? { queue: queueItemsOf(scope) } : {}),
+            // 该会话当前目标（会话级状态；无目标为 null）
+            goal: goalWireOf(String(liveSession.id)),
           })
           break
         }
@@ -960,6 +1035,14 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
           if (!ctx.sessionPersistence) throw new Error('no sessionPersistence service')
           const all = await coldSessionEvents(cmd.sessionId)
           const { events, hasMore } = projectWindowBack(ctx, all, undefined, HISTORY_TAIL)
+          // 冷会话目标：投影缓存冷读（零全量日志加载）；失败降级为 null（面板隐藏）
+          let goal: GoalWire | null = null
+          try {
+            const snap = await projectionCache()?.coldSnapshot(SessionId(cmd.sessionId))
+            goal = goalWireFromProjection((snap?.values as Record<string, unknown> | undefined)?.['goal'] as GoalProjectionLike | null | undefined)
+          } catch (e: unknown) {
+            logger.warn('GOAL', `冷会话 ${cmd.sessionId.slice(0, 12)} 目标冷读失败（降级隐藏）: ${String(e)}`)
+          }
           logger.info('WS', `冷会话历史 session=${cmd.sessionId.slice(0, 12)} events=${all.length}（下发尾部 ${events.length}）`)
           send(ws, {
             type: 'history',
@@ -967,6 +1050,7 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
             events,
             hasMore,
             total: all.length,
+            goal,
           })
         } catch (e) {
           send(ws, { type: 'error', code: 'not_found', message: `session not found: ${cmd.sessionId}` })
