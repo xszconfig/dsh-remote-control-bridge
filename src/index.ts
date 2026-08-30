@@ -1363,6 +1363,8 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
             goal: goalWireOf(String(liveSession.id)),
             // 该会话当前轮次任务列表（todos 投影；turn/start 后为空）
             todos: todosWireOf(String(liveSession.id)),
+            // 当前 OPEN 轮次起点：中途切入会话也能立即显示 Deep diving 标签（不依赖错过的事件）
+            turnSince: turnStarts.get(String(liveSession.id)) ?? null,
           })
           break
         }

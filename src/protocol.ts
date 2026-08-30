@@ -296,6 +296,8 @@ export interface EvHistory {
   goal?: GoalWire | null
   /** 该会话当前轮次任务列表（todo_write 投影；空 = 无任务）；会话级状态。 */
   todos?: TodoWire[] | null
+  /** 当前 OPEN 轮次的开始时间（null = 无进行中的轮次）；中途切入会话也能立即显示 Deep diving 标签。 */
+  turnSince?: number | null
 }
 /** 排队消息投影：placement = queued(下一轮)/steering(用户插队中)/context(系统注入)。 */
 export interface QueueItemWire {
