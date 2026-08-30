@@ -16,10 +16,10 @@ import type { SessionProjectionCache } from '@deepseek-ai/dsh-session-projection
 import type {} from '@deepseek-ai/dsh-session-title'
 import type {} from '@deepseek-ai/dsh-workspace'
 import type {} from '@deepseek-ai/dsh-session-persistence'
-import type {} from '@deepseek-ai/dsh-tools'
 import { LspManager } from './lsp.js'
 import { DebugManager, type DebugBreakpointWire } from './debug.js'
-import { loadWorkState, writeWorkState } from './work.js'
+import { loadWorkState, writeWorkState, type QueueSnapshotItem } from './work.js'
+import { defineTool } from '@deepseek-ai/dsh-tools'
 
 import {
   BRIDGE_VERSION,
@@ -36,6 +36,7 @@ import {
   type QueueItemWire,
   type ServerEvent,
   type SessionSummary,
+  type TodoWire,
   type WorkspaceSummary,
 } from './protocol.js'
 import { ConnLogger } from './logger.js'
@@ -154,12 +155,24 @@ export function apply(ctx: Context) {
         ...work.pending.map((p, i) => `${i + 1}. ${p}`),
         '（最新状态见 ~/.dsh/remote-control-work.json，完成后请把该文件清空。）',
       ].join('\n')
-      logger.info('WORK', `自动续跑：向 agent ${String(agent.id).slice(0, 12)} 注入续跑指令（待办 ${work.pending.length} 条）`)
+      logger.info('WORK', `自动续跑：向 agent ${String(agent.id).slice(0, 8)} 注入续跑指令（待办 ${work.pending.length} 条）`)
       agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }))
     }, resumeDelayMs)
     resumeTimer.unref?.()
   } else {
     logger.info('WORK', '无待办事项')
+  }
+  // 排队消息跨重启恢复：延迟到 harness 重新挂载 agent 后，对快照中仍丢失的消息重新注入
+  {
+    const queueRestoreTimer = setTimeout(() => {
+      const work = loadWorkState(WORK_FILE)
+      const sessions = Object.keys(work?.queues ?? {})
+      if (sessions.length > 0) {
+        logger.info('QUEUE', `检测到 ${sessions.length} 个会话的排队快照，尝试恢复丢失消息`)
+        for (const sid of sessions) restoreQueueIfLost(sid)
+      }
+    }, Number(process.env.DSH_REMOTE_RESUME_DELAY_MS ?? 20_000))
+    queueRestoreTimer.unref?.()
   }
 
   const upsertDevice = (deviceId: string, name: string, model?: string): StoredDevice => {
@@ -255,6 +268,34 @@ export function apply(ctx: Context) {
       logger.warn('GOAL', `读取会话 ${sessionId.slice(0, 12)} 目标失败（降级隐藏）: ${String(e)}`)
       return null
     }
+  }
+
+  /** 活会话的任务列表（todos 投影，todo/write 事件全量快照；turn/start 后清空）。 */
+  const todosOfSession = (session: Session): TodoWire[] => {
+    try {
+      const proj = (ctx as unknown as {
+        sessionProjections?: { snapshot(s: unknown): { values: Record<string, unknown> } }
+      }).sessionProjections?.snapshot(session)
+      const todos = proj?.values?.['todos'] as Array<{ content: string; status: string }> | null | undefined
+      if (!Array.isArray(todos)) return []
+      return todos
+        .filter((t) => t !== null && typeof t === 'object' && typeof t.content === 'string')
+        .map((t) => ({ content: t.content, status: typeof t.status === 'string' ? t.status : 'pending' }))
+    } catch {
+      return []
+    }
+  }
+  const todosWireOf = (sessionId: string): TodoWire[] => {
+    const session = ctx.sessions.list().find((s) => String(s.id) === sessionId)
+    return session === undefined ? [] : todosOfSession(session)
+  }
+  /** 从投影快照 values 提取 todos（冷会话订阅用）。 */
+  const todosFromValues = (values: Record<string, unknown> | undefined): TodoWire[] => {
+    const todos = values?.['todos'] as Array<{ content: string; status: string }> | null | undefined
+    if (!Array.isArray(todos)) return []
+    return todos
+      .filter((t) => t !== null && typeof t === 'object' && typeof t.content === 'string')
+      .map((t) => ({ content: t.content, status: typeof t.status === 'string' ? t.status : 'pending' }))
   }
 
   /** Desktop display title: durable title, cwd basename, then id. */
@@ -452,6 +493,45 @@ export function apply(ctx: Context) {
     log: (m) => logger.debug('LSP', m),
   })
 
+  // ---- Agent LSP 查询工具（OMP 同款：diagnostics / hover / definition / references）----
+  try {
+    ctx.tools.register(defineTool({
+      name: 'lsp_query',
+      description: '查询语言服务器（代码智能）：某文件的诊断、符号类型与文档（hover）、定义位置、引用位置。诊断需要文件曾被 Agent 编辑/写入过（语言服务器才会分析它）。',
+      parameters: {
+        action: {
+          type: 'string',
+          required: true,
+          enum: ['diagnostics', 'hover', 'definition', 'references'],
+          description: 'diagnostics = 该文件当前诊断（错误/警告）；hover = 指定位置的类型/文档；definition = 定义位置；references = 引用位置（含声明）。',
+        },
+        path: { type: 'string', required: true, description: '文件绝对路径。' },
+        line: { type: 'integer', description: '1-based 行号（hover/definition/references 用；diagnostics 忽略）。' },
+        column: { type: 'integer', description: '1-based 列号（hover/definition/references 用；diagnostics 忽略）。' },
+      },
+      output: {
+        schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            text: { type: 'string', description: '查询结果文本（位置为 路径:行:列，1-based）。' },
+          },
+        },
+        render: (_args, value) => {
+          const text = (value as { text?: string } | null | undefined)?.text ?? ''
+          return [{ type: 'text', text }]
+        },
+      },
+      execute: async (args) => {
+        const a = args as { action: 'diagnostics' | 'hover' | 'definition' | 'references'; path: string; line?: number; column?: number }
+        return lsp.query(a.action, a.path, a.line, a.column)
+      },
+    }))
+    logger.info('LSP', 'Agent 查询工具 lsp_query 已注册')
+  } catch (e: unknown) {
+    logger.warn('LSP', `lsp_query 工具注册失败（该能力禁用）: ${String(e)}`)
+  }
+
   // ---- Debug：Agent 经 REST 启动受控调试进程（Node Inspector）→ 状态/输出/变量广播到手机 ----
   const debug = new DebugManager({
     onState: (sessionId, snap) => broadcast({ type: 'debug_state', sessionId, debug: snap }),
@@ -502,6 +582,59 @@ export function apply(ctx: Context) {
     })),
   ]
 
+  // ---- 排队消息持久化：变化时快照进 work.json，重启后对比恢复（丢了才重新注入，防重复）----
+  const queueSnapTimers = new Map<string, NodeJS.Timeout>()
+  const scheduleQueueSnapshot = (sessionId: string, items: QueueItemWire[]): void => {
+    const prev = queueSnapTimers.get(sessionId)
+    if (prev !== undefined) clearTimeout(prev)
+    const t = setTimeout(() => {
+      queueSnapTimers.delete(sessionId)
+      try {
+        const work = loadWorkState(WORK_FILE)
+        const queues = { ...(work?.queues ?? {}) }
+        queues[sessionId] = {
+          items: items.map((i) => ({ id: i.id, placement: i.placement, text: i.text })),
+          at: Date.now(),
+        }
+        writeWorkState(WORK_FILE, { queues })
+      } catch (e: unknown) {
+        logger.warn('QUEUE', `队列快照写入失败 session=${sessionId.slice(0, 12)}: ${String(e)}`)
+      }
+    }, 2000)
+    t.unref?.()
+  }
+  /** 重启后恢复：快照里活队列没有的消息（按 id 或文本去重）重新注入；恢复完清掉快照。 */
+  const restoreQueueIfLost = (sessionId: string): void => {
+    try {
+      const work = loadWorkState(WORK_FILE)
+      const snap = work?.queues?.[sessionId]
+      if (snap === undefined || snap.items.length === 0) return
+      const agent = agentOf(sessionId)
+      if (agent === undefined) return // 会话未挂载：保留快照，等 agent 上线再试
+      const live = queueItemsOf(agent)
+      const missing: QueueSnapshotItem[] = snap.items.filter(
+        (it) => !live.some((l) => l.id === it.id || l.text === it.text),
+      )
+      if (missing.length === 0) {
+        // 队列完好（harness 自己恢复了）——只清快照，不注入
+        const queues = { ...(work?.queues ?? {}) }
+        delete queues[sessionId]
+        writeWorkState(WORK_FILE, { queues })
+        logger.info('QUEUE', `会话 ${sessionId.slice(0, 12)} 队列跨重启完好，清理快照`)
+        return
+      }
+      logger.info('QUEUE', `会话 ${sessionId.slice(0, 12)} 恢复丢失的排队消息 ${missing.length} 条`)
+      for (const it of missing) {
+        agent.followup(createUserMessage({ content: [{ type: 'text', text: it.text }], source: { kind: 'user' } }))
+      }
+      const queues = { ...(work?.queues ?? {}) }
+      delete queues[sessionId]
+      writeWorkState(WORK_FILE, { queues })
+    } catch (e: unknown) {
+      logger.warn('QUEUE', `队列恢复失败 session=${sessionId.slice(0, 12)}: ${String(e)}`)
+    }
+  }
+
   // ---- Deep Diving：模型请求起止 → 手机指示条 ----
   // modelStreams：会话 → 进行中的模型请求开始时间。订阅时下发，
   // 让"切进正在思考的会话"也能立刻看到指示条（状态随会话，不串扰）。
@@ -523,6 +656,19 @@ export function apply(ctx: Context) {
       }
     })()
   }, { global: true, prepend: true })
+
+  // Deep Diving 计时：服务端时钟按秒广播 elapsedSeconds（客户端不本地计时，一切以服务端为准）
+  const divingTicker = setInterval(() => {
+    for (const [sid, startedAt] of modelStreams) {
+      broadcast({
+        type: 'deep_diving_tick',
+        sessionId: sid,
+        elapsedSeconds: Math.max(0, Math.floor((Date.now() - startedAt) / 1000)),
+        since: startedAt,
+      })
+    }
+  }, 1000)
+  divingTicker.unref?.()
 
   // ---- live event fan-out ----
   ctx.on('session/event', (session, event) => {
@@ -583,6 +729,7 @@ export function apply(ctx: Context) {
             const items = queueItemsOf(agent)
             logger.debug('QUEUE', `session_queue 广播 session=${String(session.id).slice(0, 12)} items=${items.length}`)
             broadcast({ type: 'session_queue', sessionId: String(session.id), items })
+            scheduleQueueSnapshot(String(session.id), items)
           }
         } catch (e: unknown) {
           // 队列投影失败绝不能吞掉后续事件处理
@@ -603,6 +750,17 @@ export function apply(ctx: Context) {
       })
       return
     }
+    // 任务列表变更（todo/write 落库）：同样延迟重读 todos 投影广播（会话级隔离）
+    if ((event.type as string) === 'todo/write') {
+      queueMicrotask(() => {
+        try {
+          broadcast({ type: 'todos_update', sessionId: String(session.id), todos: todosWireOf(String(session.id)) })
+        } catch (e: unknown) {
+          logger.warn('TODO', `todo/write 延迟广播失败 session=${String(session.id).slice(0, 12)}: ${String(e)}`)
+        }
+      })
+      return
+    }
     const scope = ctx.agents.get(session.id)
     for (const proj of projectEvent(ctx, event, scope)) {
       broadcast({ type: 'event', sessionId: String(session.id), event: proj })
@@ -615,6 +773,8 @@ export function apply(ctx: Context) {
 
   ctx.on('agent/status', ({ agent, status }) => {
     broadcast({ type: 'agent_status', sessionId: String(agent.id), status })
+    // agent 重新挂载并开跑：立即尝试恢复该会话丢失的排队消息（覆盖会话在 boot 延迟后才打开的场景）
+    if (status === 'running') restoreQueueIfLost(String(agent.id))
   })
 
   // 会话列表增量：新建/下线时推该行（hello 全量对账兜底）。
@@ -1056,6 +1216,8 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
             ...(scope?.session === liveSession ? { queue: queueItemsOf(scope) } : {}),
             // 该会话当前目标（会话级状态；无目标为 null）
             goal: goalWireOf(String(liveSession.id)),
+            // 该会话当前轮次任务列表（todos 投影；turn/start 后为空）
+            todos: todosWireOf(String(liveSession.id)),
           })
           break
         }
@@ -1066,9 +1228,12 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
           const { events, hasMore } = projectWindowBack(ctx, all, undefined, HISTORY_TAIL)
           // 冷会话目标：投影缓存冷读（零全量日志加载）；失败降级为 null（面板隐藏）
           let goal: GoalWire | null = null
+          let todos: TodoWire[] = []
           try {
             const snap = await projectionCache()?.coldSnapshot(SessionId(cmd.sessionId))
-            goal = goalWireFromProjection((snap?.values as Record<string, unknown> | undefined)?.['goal'] as GoalProjectionLike | null | undefined)
+            const values = snap?.values as Record<string, unknown> | undefined
+            goal = goalWireFromProjection(values?.['goal'] as GoalProjectionLike | null | undefined)
+            todos = todosFromValues(values)
           } catch (e: unknown) {
             logger.warn('GOAL', `冷会话 ${cmd.sessionId.slice(0, 12)} 目标冷读失败（降级隐藏）: ${String(e)}`)
           }
@@ -1080,6 +1245,7 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
             hasMore,
             total: all.length,
             goal,
+            todos,
           })
         } catch (e) {
           send(ws, { type: 'error', code: 'not_found', message: `session not found: ${cmd.sessionId}` })
@@ -1625,6 +1791,9 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
     clients.clear()
     wss.close()
     clearInterval(pairPrune)
+    clearInterval(divingTicker)
+    for (const t of queueSnapTimers.values()) clearTimeout(t)
+    queueSnapTimers.clear()
     clearInterval(heartbeat)
     for (const entry of pendingApprovals.values()) {
       clearTimeout(entry.timer)

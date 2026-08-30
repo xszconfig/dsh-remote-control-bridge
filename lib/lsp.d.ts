@@ -22,6 +22,7 @@ export declare class LspManager {
     private readonly servers;
     private readonly missing;
     private readonly diagTimers;
+    private readonly diagCache;
     private tsServerPathCache;
     constructor(opts: LspOptions);
     /** 已就绪（二进制存在）的语言列表，hello 快照里下发给手机。 */
@@ -31,6 +32,13 @@ export declare class LspManager {
     /** 立即同步一次文件内容（绕过节流，供测试）。 */
     flush(path: string): void;
     dispose(): void;
+    /**
+     * Agent 主动查询语言服务器（OMP 同款能力）：diagnostics / hover / definition / references。
+     * 返回给模型看的纯文本；诊断优先读缓存（push/pull 两个通道都会更新）。
+     */
+    query(action: 'diagnostics' | 'hover' | 'definition' | 'references', path: string, line?: number, column?: number): Promise<{
+        text: string;
+    }>;
     private cmdFor;
     /**
      * 官方 JetBrains Kotlin LSP 二进制三级解析：

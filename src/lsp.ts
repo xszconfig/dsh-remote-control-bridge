@@ -66,6 +66,8 @@ interface ServerState {
   pullDiagnostics: boolean
   /** uri → LSP 文档版本号（didChange 的 version 必须是递增的小整数，Date.now 会溢出 IntelliJ 的 int）。 */
   docVersions: Map<string, number>
+  /** 当前 workspace 根（回应 workspace/workspaceFolders 请求用）。 */
+  workspaceFolders: Array<{ uri: string; name: string }>
 }
 
 export interface LspOptions {
@@ -81,6 +83,7 @@ export class LspManager {
   private readonly servers = new Map<string, ServerState>()
   private readonly missing = new Set<string>() // 二进制缺失的语言
   private readonly diagTimers = new Map<string, NodeJS.Timeout>()
+  private readonly diagCache = new Map<string, LspDiagnosticWire[]>() // uri → 最新诊断（push/pull 共用）
   private tsServerPathCache: string | null | undefined // undefined=未探测 null=没有
 
   constructor(private readonly opts: LspOptions) {}
@@ -149,6 +152,58 @@ export class LspManager {
     this.servers.clear()
   }
 
+  /**
+   * Agent 主动查询语言服务器（OMP 同款能力）：diagnostics / hover / definition / references。
+   * 返回给模型看的纯文本；诊断优先读缓存（push/pull 两个通道都会更新）。
+   */
+  async query(action: 'diagnostics' | 'hover' | 'definition' | 'references', path: string, line?: number, column?: number): Promise<{ text: string }> {
+    const lang = this.langFor(path)
+    if (lang === undefined) return { text: `不支持的文件类型：${path}` }
+    const state = this.ensureServer(lang, path)
+    if (state === undefined) return { text: `${lang} 语言服务器不可用（二进制缺失或启动退避中）` }
+    const uri = pathToFileURL(path).href
+    try {
+      await state.initPromise
+    } catch {
+      return { text: `${lang} 语言服务器初始化失败` }
+    }
+    if (state.dead) return { text: `${lang} 语言服务器已退出` }
+
+    if (action === 'diagnostics') {
+      // 确保文档已打开并同步（首次查询会触发一次诊断流程），随后读缓存
+      this.notifyFileChanged(path)
+      this.flush(path)
+      await new Promise((r) => setTimeout(r, 1200))
+      const cached = this.diagCache.get(uri)
+      if (cached === undefined || cached.length === 0) {
+        return { text: '暂无诊断（语言服务器可能仍在分析，或该文件确实没有问题）' }
+      }
+      const lines = cached.map((d) => {
+        const sev = d.severity === 1 ? 'error' : d.severity === 2 ? 'warning' : d.severity === 3 ? 'info' : 'hint'
+        return `[${sev}] ${path}:${d.line}:${d.column} ${d.message}`
+      })
+      return { text: lines.slice(0, 100).join('\n') }
+    }
+
+    const pos = { line: Math.max((line ?? 1) - 1, 0), character: Math.max((column ?? 1) - 1, 0) }
+    try {
+      if (action === 'hover') {
+        const r = await this.request(state, 'textDocument/hover', { textDocument: { uri }, position: pos })
+        const h = r as { contents?: unknown } | null | undefined
+        return { text: formatHover(h?.contents) }
+      }
+      const method = action === 'definition' ? 'textDocument/definition' : 'textDocument/references'
+      const r = await this.request(state, method, {
+        textDocument: { uri },
+        position: pos,
+        ...(action === 'references' ? { context: { includeDeclaration: true } } : {}),
+      })
+      return { text: formatLocations(r, path) }
+    } catch (e: unknown) {
+      return { text: `${action} 查询失败：${String(e)}` }
+    }
+  }
+
   // ---- 内部 ----
 
   private cmdFor(lang: string): string[] {
@@ -206,6 +261,31 @@ export class LspManager {
     return undefined
   }
 
+  /**
+   * 官方 IntelliJ Kotlin LSP 需要全量能力声明（oh-my-pi 同款）：只声明 publishDiagnostics 会让
+   * IntelliJ 不完整启用分析/索引。这里覆盖诊断 + hover/definition/references（query 用）。
+   */
+  private kotlinCapabilities(): Record<string, unknown> {
+    const symKind = { valueSet: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26] }
+    return {
+      textDocument: {
+        synchronization: { didSave: true, dynamicRegistration: false, willSave: false, willSaveWaitUntil: false },
+        hover: { contentFormat: ['markdown', 'plaintext'], dynamicRegistration: false },
+        definition: { dynamicRegistration: false, linkSupport: true },
+        typeDefinition: { dynamicRegistration: false, linkSupport: true },
+        implementation: { dynamicRegistration: false, linkSupport: true },
+        references: { dynamicRegistration: false },
+        publishDiagnostics: { relatedInformation: true, versionSupport: true, tagSupport: { valueSet: [1, 2] }, codeDescriptionSupport: true, dataSupport: true },
+        diagnostic: { dynamicRegistration: true },
+      },
+      window: { workDoneProgress: true },
+      workspace: {
+        configuration: true,
+        workspaceFolders: true,
+      },
+    }
+  }
+
   private langFor(path: string): string | undefined {
     const dot = path.lastIndexOf('.')
     if (dot < 0) return undefined
@@ -258,6 +338,13 @@ export class LspManager {
     try {
       const proc = spawn(bin, cmd.slice(1), {
         stdio: ['pipe', 'pipe', 'pipe'],
+        // Kotlin（IntelliJ 内核）默认堆太小会在索引 stdlib 时 OOM：未显式设置时给 4g
+        env: {
+          ...process.env,
+          ...(lang === 'kotlin' && (process.env.IJ_JAVA_OPTIONS === undefined || process.env.IJ_JAVA_OPTIONS === '')
+            ? { IJ_JAVA_OPTIONS: '-Xmx4g' }
+            : {}),
+        },
       })
       const state: ServerState = {
         proc,
@@ -270,6 +357,7 @@ export class LspManager {
         initPromise: Promise.resolve(),
         pullDiagnostics: LANGS[lang].pullDiagnostics === true,
         docVersions: new Map(),
+        workspaceFolders: [{ uri: pathToFileURL(dirname(path)).href, name: basename(dirname(path)) }],
       }
       proc.on('error', (e) => {
         this.opts.log?.(`[lsp] ${lang} spawn 失败: ${String(e)}`)
@@ -318,14 +406,11 @@ export class LspManager {
         rootUri: kotlinRootUri,
         ...(isKotlin ? { rootPath: kotlinRoot } : {}),
         ...(isKotlin ? { workspaceFolders: [{ uri: kotlinRootUri, name: basename(kotlinRoot) }] } : {}),
-        // 声明 publishDiagnostics 能力：否则 ts-language-server 可能静默切换诊断拉取模式
-        capabilities: {
-          textDocument: {
-            publishDiagnostics: { relatedInformation: true },
-            ...(isKotlin ? { synchronization: { didSave: true, willSave: true }, diagnostic: { relatedInformation: true } } : {}),
-          },
-          ...(isKotlin ? { workspace: { workspaceFolders: true, configuration: true }, window: { workDoneProgress: true } } : {}),
-        },
+        // 声明 publishDiagnostics 能力：否则 ts-language-server 可能静默切换诊断拉取模式；
+        // Kotlin 用全量能力（oh-my-pi 同款），否则 IntelliJ 不完整启用分析。
+        capabilities: isKotlin
+          ? this.kotlinCapabilities()
+          : { textDocument: { publishDiagnostics: { relatedInformation: true } } },
         ...(isKotlin ? { initializationOptions: kotlinInitOptions } : {}),
         ...(isTs
           ? (() => {
@@ -336,8 +421,11 @@ export class LspManager {
             })()
           : {}),
       }).then(() => {
+        if (state.dead) return
         // initialized 是通知不是请求：带 id 会让 IntelliJ LSP 报 "no handler for request: initialized" 并跳过项目导入
-        if (!state.dead) this.notify(state, 'initialized', {})
+        this.notify(state, 'initialized', {})
+        // 官方 Kotlin LSP 在 initialized 后需要一次 didChangeConfiguration，否则分析不启动（oh-my-pi 同款时序）
+        if (isKotlin) this.notify(state, 'workspace/didChangeConfiguration', { settings: {} })
       }).catch((e) => {
         this.opts.log?.(`[lsp] ${lang} 初始化失败: ${String(e)}`)
       })
@@ -392,6 +480,7 @@ export class LspManager {
         .map((d) => this.toWireDiagnostic(path, d))
         .filter((d): d is LspDiagnosticWire => d !== null)
         .slice(0, 200)
+      this.diagCache.set(p.uri, diags)
       this.opts.onDiagnostics(path, state.docSessions.get(p.uri), diags)
       return
     }
@@ -472,6 +561,7 @@ export class LspManager {
           .map((d) => this.toWireDiagnostic(path, d))
           .filter((d): d is LspDiagnosticWire => d !== null)
           .slice(0, 200)
+        this.diagCache.set(uri, diags)
         if (diags.length > 0) {
           this.opts.onDiagnostics(path, state.docSessions.get(uri), diags)
         } else {
@@ -494,4 +584,49 @@ function extractFrame(buf: Buffer): { payload: Buffer; rest: Buffer } | null {
   const payload = buf.subarray(headerEnd + 4, headerEnd + 4 + len)
   const rest = buf.subarray(headerEnd + 4 + len)
   return { payload, rest }
+}
+
+/** hover 内容格式化：支持 MarkedString / MarkedString[] / MarkupContent。 */
+function formatHover(contents: unknown): string {
+  if (contents === null || contents === undefined) return '（无 hover 信息）'
+  const one = (c: unknown): string => {
+    if (typeof c === 'string') return c
+    if (c !== null && typeof c === 'object') {
+      const o = c as { value?: unknown; language?: unknown }
+      if (typeof o.value === 'string') return o.value
+    }
+    return ''
+  }
+  const text = Array.isArray(contents)
+    ? contents.map(one).filter((t) => t.length > 0).join('\n\n')
+    : one(contents)
+  return text.length > 0 ? text.slice(0, 4000) : '（无 hover 信息）'
+}
+
+/** definition/references 位置格式化：Location | Location[] | LocationLink[] | null。 */
+function formatLocations(result: unknown, fallbackPath: string): string {
+  if (result === null || result === undefined) return '（无结果）'
+  const arr = Array.isArray(result) ? result : [result]
+  const lines: string[] = []
+  for (const item of arr) {
+    if (item === null || typeof item !== 'object') continue
+    const o = item as { uri?: unknown; targetUri?: unknown; range?: unknown; targetRange?: unknown; targetSelectionRange?: unknown }
+    const uri = typeof o.uri === 'string' ? o.uri : typeof o.targetUri === 'string' ? o.targetUri : undefined
+    const range = (o.range ?? o.targetSelectionRange ?? o.targetRange ?? {}) as { start?: { line?: number; character?: number } }
+    if (uri === undefined) continue
+    let path: string
+    try {
+      path = fileURLToPath(uri)
+    } catch {
+      path = uri
+    }
+    const line = (range.start?.line ?? 0) + 1
+    const col = (range.start?.character ?? 0) + 1
+    lines.push(`${path === fallbackPath ? path : path}:${line}:${col}`)
+    if (lines.length >= 20) {
+      lines.push('…（结果超过 20 条，已截断）')
+      break
+    }
+  }
+  return lines.length > 0 ? lines.join('\n') : '（无结果）'
 }

@@ -294,6 +294,8 @@ export interface EvHistory {
   modelWaitingSince?: number | null
   /** 该会话当前持久化目标（null = 无目标）；会话级状态，切换会话不串扰。 */
   goal?: GoalWire | null
+  /** 该会话当前轮次任务列表（todo_write 投影；空 = 无任务）；会话级状态。 */
+  todos?: TodoWire[] | null
 }
 /** 排队消息投影：placement = queued(下一轮)/steering(用户插队中)/context(系统注入)。 */
 export interface QueueItemWire {
@@ -323,6 +325,24 @@ export interface EvModelWaitingDone {
   sessionId: string
   startedAt: number
   elapsedMs: number
+}
+/** Deep Diving 服务端计时：按秒广播服务端时钟算好的已等待秒数（客户端不本地计时）。 */
+export interface EvDeepDivingTick {
+  type: 'deep_diving_tick'
+  sessionId: string
+  elapsedSeconds: number
+  since: number
+}
+/** 任务列表条目（todo_write 投影；status = pending / in_progress / completed）。 */
+export interface TodoWire {
+  content: string
+  status: string
+}
+/** 任务列表变更推送：todo/write 落库后重读该会话 todos 广播（空数组 = 无任务）。 */
+export interface EvTodosUpdate {
+  type: 'todos_update'
+  sessionId: string
+  todos: TodoWire[]
 }
 /** 思考流式增量（reasoning-delta 累积，节流广播；text 为空 = 清除实时思考行）。 */
 export interface EvThinkDelta {
@@ -468,9 +488,11 @@ export type ServerEvent =
   | EvLogsRequest
   | EvModelWaiting
   | EvModelWaitingDone
+  | EvDeepDivingTick
   | EvThinkDelta
   | EvDiagnostics
   | EvGoalUpdate
+  | EvTodosUpdate
   | EvDebugState
   | EvDebugOutput
   | EvDebugVariables
@@ -520,4 +542,4 @@ export interface DeviceRecord {
   lastSeenAt: number
 }
 
-export const BRIDGE_VERSION = '0.11.7'
+export const BRIDGE_VERSION = '0.11.8'
