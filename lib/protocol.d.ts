@@ -298,6 +298,13 @@ export interface EvDeepDivingTick {
     elapsedSeconds: number;
     since: number;
 }
+/** Deep Diving 轮次状态（与 DSH Web 对齐）：open = 整个轮次期间显示标签；since = 轮次起点。 */
+export interface EvTurnStatus {
+    type: 'turn_status';
+    sessionId: string;
+    open: boolean;
+    since?: number;
+}
 /** 任务列表条目（todo_write 投影；status = pending / in_progress / completed）。 */
 export interface TodoWire {
     content: string;
@@ -445,7 +452,7 @@ export interface EvDeviceRevoked {
     type: 'device_revoked';
     deviceId: string;
 }
-export type ServerEvent = EvHello | EvSessions | EvAgents | EvEvent | EvHistory | EvSessionQueue | EvLogsRequest | EvModelWaiting | EvModelWaitingDone | EvDeepDivingTick | EvThinkDelta | EvDiagnostics | EvGoalUpdate | EvTodosUpdate | EvDebugState | EvDebugOutput | EvDebugVariables | EvServerBoot | EvSessionTitle | EvSessionUpsert | EvAgentStatus | EvApprovalRequest | EvApprovalResolved | EvQuestionRequest | EvQuestionResolved | EvError | EvDeviceRegistered | EvDeviceRevoked;
+export type ServerEvent = EvHello | EvSessions | EvAgents | EvEvent | EvHistory | EvSessionQueue | EvLogsRequest | EvModelWaiting | EvModelWaitingDone | EvDeepDivingTick | EvTurnStatus | EvThinkDelta | EvDiagnostics | EvGoalUpdate | EvTodosUpdate | EvDebugState | EvDebugOutput | EvDebugVariables | EvServerBoot | EvSessionTitle | EvSessionUpsert | EvAgentStatus | EvApprovalRequest | EvApprovalResolved | EvQuestionRequest | EvQuestionResolved | EvError | EvDeviceRegistered | EvDeviceRevoked;
 export interface PingInfo {
     ok: true;
     version: string;
