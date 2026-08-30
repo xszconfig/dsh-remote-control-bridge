@@ -18,6 +18,7 @@ import type {} from '@deepseek-ai/dsh-workspace'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-tools'
 import { LspManager } from './lsp.js'
+import { DebugManager, type DebugBreakpointWire } from './debug.js'
 import { loadWorkState, writeWorkState } from './work.js'
 
 import {
@@ -449,6 +450,14 @@ export function apply(ctx: Context) {
       broadcast({ type: 'diagnostics', sessionId: sessionId ?? '', path, diagnostics })
     },
     log: (m) => logger.debug('LSP', m),
+  })
+
+  // ---- Debug：Agent 经 REST 启动受控调试进程（Node Inspector）→ 状态/输出/变量广播到手机 ----
+  const debug = new DebugManager({
+    onState: (sessionId, snap) => broadcast({ type: 'debug_state', sessionId, debug: snap }),
+    onOutput: (sessionId, line) => broadcast({ type: 'debug_output', sessionId, line }),
+    onVariables: (sessionId, variablesReference, variables) =>
+      broadcast({ type: 'debug_variables', sessionId, variablesReference, variables }),
   })
 
   // ---- 历史分页（尾部优先 + 按 seq 翻页）----
@@ -1006,6 +1015,26 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
         logger.info('QUEUE', `排队操作 ${cmd.action} item=${cmd.itemId.slice(0, 8)} session=${cmd.sessionId.slice(0, 12)}`)
         break
       }
+      case 'debug_command': {
+        try {
+          if (cmd.action === 'variables') {
+            if (cmd.variablesReference === undefined || cmd.variablesReference === '') {
+              send(ws, { type: 'error', code: 'bad_request', message: 'variables 需要 variablesReference' })
+            } else {
+              debug.variables(cmd.sessionId, cmd.variablesReference)
+            }
+            break
+          }
+          if (cmd.action === 'stop') {
+            void debug.stop(cmd.sessionId)
+            break
+          }
+          debug.command(cmd.sessionId, cmd.action)
+        } catch (e: unknown) {
+          send(ws, { type: 'error', code: 'debug_unavailable', message: String(e) })
+        }
+        break
+      }
       case 'subscribe': {
         if (!cmd.sessionId) {
           send(ws, { type: 'error', code: 'not_found', message: 'subscribe 需要 sessionId' })
@@ -1516,6 +1545,62 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
     },
   }
 
+  /**
+   * Agent（桌面端）启动受控调试进程：POST /remote/debug/start
+   * body: { sessionId, program, cwd?, breakpoints?: [{ path, line }] }
+   * 返回初始状态快照；后续状态经 WS 广播（debug_state/debug_output/debug_variables）。
+   */
+  const debugStartRoute: WebRoute = {
+    kind: 'exact',
+    path: '/remote/debug/start',
+    handler: async (req, res) => {
+      if (!allowLocalOrEnvToken(req, res, envToken)) return denied(res)
+      if (req.method !== 'POST') return json(res, { error: 'use POST' }, 405)
+      let body = ''
+      for await (const chunk of req) body += typeof chunk === 'string' ? chunk : chunk.toString()
+      let parsed: { sessionId?: string; program?: string; cwd?: string; breakpoints?: DebugBreakpointWire[] }
+      try {
+        parsed = JSON.parse(body) as typeof parsed
+      } catch {
+        return json(res, { error: 'bad json' }, 400)
+      }
+      if (parsed.sessionId === undefined || parsed.program === undefined || parsed.program.trim() === '') {
+        return json(res, { error: 'sessionId 与 program 必填' }, 400)
+      }
+      try {
+        const snap = debug.start(parsed.sessionId, {
+          program: parsed.program,
+          ...(parsed.cwd !== undefined && parsed.cwd !== '' ? { cwd: parsed.cwd } : {}),
+          ...(parsed.breakpoints !== undefined ? { breakpoints: parsed.breakpoints } : {}),
+        })
+        return json(res, { ok: true, debug: snap })
+      } catch (e: unknown) {
+        return json(res, { ok: false, error: String(e) }, 409)
+      }
+    },
+  }
+
+  /** Agent（桌面端）停止受控调试进程：POST /remote/debug/stop { sessionId }。 */
+  const debugStopRoute: WebRoute = {
+    kind: 'exact',
+    path: '/remote/debug/stop',
+    handler: async (req, res) => {
+      if (!allowLocalOrEnvToken(req, res, envToken)) return denied(res)
+      if (req.method !== 'POST') return json(res, { error: 'use POST' }, 405)
+      let body = ''
+      for await (const chunk of req) body += typeof chunk === 'string' ? chunk : chunk.toString()
+      let parsed: { sessionId?: string }
+      try {
+        parsed = JSON.parse(body) as typeof parsed
+      } catch {
+        return json(res, { error: 'bad json' }, 400)
+      }
+      if (parsed.sessionId === undefined) return json(res, { error: 'sessionId 必填' }, 400)
+      await debug.stop(parsed.sessionId)
+      json(res, { ok: true })
+    },
+  }
+
   ctx.webServer.registerUpgrade(upgrade)
   ctx.webServer.register(ping)
   ctx.webServer.register(health)
@@ -1528,6 +1613,8 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
   ctx.webServer.register(approvalTestRoute)
   ctx.webServer.register(logsRoute)
   ctx.webServer.register(phoneLogsRoute)
+  ctx.webServer.register(debugStartRoute)
+  ctx.webServer.register(debugStopRoute)
 
   void runMuxClient()
 

@@ -40,6 +40,7 @@ const LANGS: Record<string, LanguageConfig> = {
   python: { languageId: 'python', exts: ['.py'], cmd: ['pyright-langserver', '--stdio'] },
   rust: { languageId: 'rust', exts: ['.rs'], cmd: ['rust-analyzer'] },
   cpp: { languageId: 'cpp', exts: ['.c', '.h', '.cc', '.cpp', '.hpp'], cmd: ['clangd'] },
+  kotlin: { languageId: 'kotlin', exts: ['.kt', '.kts'], cmd: ['kotlin-language-server', '--stdio'] },
 }
 
 const DIAG_THROTTLE_MS = 400

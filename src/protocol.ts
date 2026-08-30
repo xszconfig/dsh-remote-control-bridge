@@ -195,6 +195,13 @@ export interface CmdRevokeDevice {
   type: 'revoke_device'
   deviceId: string
 }
+/** 调试控制：resume/step(单步)/step_out(跳出)/stop/variables(按引用拉变量，惰性展开)。 */
+export interface CmdDebugCommand {
+  type: 'debug_command'
+  sessionId: string
+  action: 'resume' | 'step' | 'step_out' | 'stop' | 'variables'
+  variablesReference?: string
+}
 
 export type ClientCommand =
   | CmdSubscribe
@@ -209,6 +216,7 @@ export type ClientCommand =
   | CmdUploadLogs
   | CmdRegisterDevice
   | CmdRevokeDevice
+  | CmdDebugCommand
 
 // ---- server -> client events ----
 
@@ -356,6 +364,58 @@ export interface EvGoalUpdate {
   sessionId: string
   goal: GoalWire | null
 }
+/** 调试断点（1-based 行号）。 */
+export interface DebugBreakpointWire {
+  path: string
+  line: number
+}
+export interface DebugScopeWire {
+  name: string
+  variablesReference: string
+}
+export interface DebugFrameWire {
+  id: string
+  name: string
+  path: string
+  line: number
+  scopes: DebugScopeWire[]
+}
+export interface DebugVariableWire {
+  name: string
+  value: string
+  type?: string
+  hasChildren: boolean
+  variablesReference: string
+}
+/** 调试会话状态快照（服务端投影为准，单向流）。 */
+export interface DebugStateWire {
+  state: 'starting' | 'running' | 'paused' | 'stopped'
+  program: string
+  cwd: string
+  breakpoints: DebugBreakpointWire[]
+  paused?: {
+    reason: string
+    stoppedAt: { path: string; line: number } | null
+    frames: DebugFrameWire[]
+  }
+  error?: string
+}
+export interface EvDebugState {
+  type: 'debug_state'
+  sessionId: string
+  debug: DebugStateWire
+}
+export interface EvDebugOutput {
+  type: 'debug_output'
+  sessionId: string
+  line: string
+}
+export interface EvDebugVariables {
+  type: 'debug_variables'
+  sessionId: string
+  variablesReference: string
+  variables: DebugVariableWire[]
+}
 /** 服务端重启通知：客户端重连后推送（版本 + 启动时间 + 新增功能说明）。 */
 export interface EvServerBoot {
   type: 'server_boot'
@@ -411,6 +471,9 @@ export type ServerEvent =
   | EvThinkDelta
   | EvDiagnostics
   | EvGoalUpdate
+  | EvDebugState
+  | EvDebugOutput
+  | EvDebugVariables
   | EvServerBoot
   | EvSessionTitle
   | EvSessionUpsert
@@ -457,4 +520,4 @@ export interface DeviceRecord {
   lastSeenAt: number
 }
 
-export const BRIDGE_VERSION = '0.11.6'
+export const BRIDGE_VERSION = '0.11.7'
