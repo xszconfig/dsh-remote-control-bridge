@@ -231,6 +231,8 @@ export interface EvHello {
   pendingQuestions: QuestionRequestWire[]
   /** LSP 代码智能状态：语言 → 是否可用（server 二进制已安装）。 */
   lsp?: { languages: string[] }
+  /** 持久化工作状态（重启后自动续跑）：当前事项 + 待办清单。 */
+  work?: { activity: string | null; pending: string[] }
 }
 export interface EvSessions {
   type: 'sessions'
@@ -425,4 +427,4 @@ export interface DeviceRecord {
   lastSeenAt: number
 }
 
-export const BRIDGE_VERSION = '0.11.0'
+export const BRIDGE_VERSION = '0.11.1'

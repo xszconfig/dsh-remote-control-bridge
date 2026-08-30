@@ -18,6 +18,7 @@ import type {} from '@deepseek-ai/dsh-workspace'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-tools'
 import { LspManager } from './lsp.js'
+import { loadWorkState, writeWorkState } from './work.js'
 
 import {
   BRIDGE_VERSION,
@@ -50,6 +51,8 @@ const logger = new ConnLogger('dsh-remote-control-bridge')
 const dshHome = process.env.DSH_HOME ?? join(homedir(), '.dsh')
 const serverId = loadOrCreateServerId()
 const host = hostname()
+/** 持久化工作状态：重启后自报版本 + 恢复进行中事项/待办（自动续跑）。 */
+const WORK_FILE = join(dshHome, 'remote-control-work.json')
 
 interface StoredDevice extends DeviceRecord {
   token: string
@@ -118,6 +121,18 @@ export function apply(ctx: Context) {
     for (const [t, exp] of pairTokens) if (exp < now) pairTokens.delete(t)
   }, 60_000)
   pairPrune.unref?.()
+
+  // ---- 启动自检：版本 + 待办恢复（重启后自动续跑，不等客户端来问）----
+  const bootWork = loadWorkState(WORK_FILE)
+  const recentClients = devices.filter((d) => d.lastSeenAt !== undefined && Date.now() - d.lastSeenAt < 24 * 3600_000)
+  logger.info('BOOT', `bridge ${BRIDGE_VERSION} 启动完成 serverId=${serverId.slice(0, 8)} host=${host} 会话=${ctx.sessions.list().length} 已配对设备=${devices.length}（24h 内活跃 ${recentClients.length}）`)
+  if (bootWork !== null && (bootWork.activity !== null || bootWork.pending.length > 0)) {
+    logger.info('WORK', `待办恢复：活动="${bootWork.activity ?? '-'}" · 待办 ${bootWork.pending.length} 条`)
+    for (const p of bootWork.pending) logger.info('WORK', `  - ${p}`)
+    logger.info('WORK', '恢复的 Agent 会话应从 /remote/work 读取并自动继续')
+  } else {
+    logger.info('WORK', '无待办事项')
+  }
 
   const upsertDevice = (deviceId: string, name: string, model?: string): StoredDevice => {
     const now = Date.now()
@@ -302,6 +317,10 @@ export function apply(ctx: Context) {
     pendingRemoteApprovals: [...muxRemoteApprovals.values()],
     pendingQuestions: [...muxQuestions.values()],
     lsp: { languages: lsp.availableLangs() },
+    work: (() => {
+      const w = loadWorkState(WORK_FILE)
+      return w === null ? { activity: null, pending: [] } : { activity: w.activity, pending: w.pending }
+    })(),
   })
 
   // 广播统计：每 5s 聚合输出一次「下行推送 X 条 → Y 客户端」，
@@ -1149,7 +1168,45 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
   const health: WebRoute = {
     kind: 'exact',
     path: '/remote/health',
-    handler: async (_req, res) => json(res, { ok: true, version: BRIDGE_VERSION, sessions: (await listSessions()).length }),
+    handler: async (_req, res) => {
+      const work = loadWorkState(WORK_FILE)
+      json(res, {
+        ok: true,
+        version: BRIDGE_VERSION,
+        sessions: (await listSessions()).length,
+        work: work === null
+          ? { activity: null, pending: 0 }
+          : { activity: work.activity, pending: work.pending.length },
+      })
+    },
+  }
+
+  // 持久化工作状态（重启后自动续跑）：GET 读取 / PUT 更新（Agent 重启前写入用）
+  const workRoute: WebRoute = {
+    kind: 'exact',
+    path: '/remote/work',
+    handler: async (req, res) => {
+      if (!allowLocalOrEnvToken(req, res, envToken)) return denied(res)
+      if (req.method === 'PUT' || req.method === 'POST') {
+        let body = ''
+        for await (const chunk of req) body += typeof chunk === 'string' ? chunk : chunk.toString()
+        let parsed: { activity?: string | null; pending?: string[] }
+        try {
+          parsed = JSON.parse(body) as typeof parsed
+        } catch {
+          json(res, { error: 'bad json' }, 400)
+          return
+        }
+        const state = writeWorkState(WORK_FILE, {
+          ...(parsed.activity !== undefined ? { activity: parsed.activity } : {}),
+          ...(parsed.pending !== undefined ? { pending: parsed.pending } : {}),
+        })
+        logger.info('WORK', `工作状态更新：activity="${state.activity ?? '-'}" pending=${state.pending.length}`)
+        json(res, state)
+        return
+      }
+      json(res, loadWorkState(WORK_FILE) ?? { activity: null, pending: [], updatedAt: 0 })
+    },
   }
 
   const sessionsRoute: WebRoute = {
@@ -1335,6 +1392,7 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
   ctx.webServer.registerUpgrade(upgrade)
   ctx.webServer.register(ping)
   ctx.webServer.register(health)
+  ctx.webServer.register(workRoute)
   ctx.webServer.register(sessionsRoute)
   ctx.webServer.register(pairInfo)
   ctx.webServer.register(pairPage)

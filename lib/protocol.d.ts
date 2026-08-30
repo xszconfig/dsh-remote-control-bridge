@@ -194,6 +194,11 @@ export interface EvHello {
     lsp?: {
         languages: string[];
     };
+    /** 持久化工作状态（重启后自动续跑）：当前事项 + 待办清单。 */
+    work?: {
+        activity: string | null;
+        pending: string[];
+    };
 }
 export interface EvSessions {
     type: 'sessions';
@@ -359,4 +364,4 @@ export interface DeviceRecord {
     createdAt: number;
     lastSeenAt: number;
 }
-export declare const BRIDGE_VERSION = "0.11.0";
+export declare const BRIDGE_VERSION = "0.11.1";
