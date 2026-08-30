@@ -32,15 +32,33 @@ export declare class LspManager {
     flush(path: string): void;
     dispose(): void;
     private cmdFor;
+    /**
+     * 官方 JetBrains Kotlin LSP 二进制三级解析：
+     * a. DSH_KOTLIN_LSP_BIN（绝对路径或 PATH 上的名字）；
+     * b. 解包在 ~/.dsh/kotlin-lsp/server/bin/intellij-server；
+     * c. PATH 上的 `kotlin-lsp`。
+     */
+    private kotlinBin;
+    /** IntelliJ LSP 的索引/缓存目录（稳定路径，跨进程复用，避免每次重建索引）。 */
+    private kotlinIndexDir;
+    /** Kotlin 需要项目根（含 build 文件）才能导入分析；找不到就退回文件所在目录。 */
+    private kotlinProjectRoot;
+    private kotlinCmd;
+    /** 项目根里的构建系统：Gradle / Maven。用于显式 buildTools 触发 IntelliJ 的项目导入。 */
+    private kotlinBuildTool;
     private langFor;
     /** 全局 typescript 安装里的 tsserver.js（typescript-language-server 不捆绑 typescript 时需要显式指路）。 */
     private tsserverPath;
     private findExecutable;
     private ensureServer;
     private killServer;
-    private send;
     private notify;
     private request;
     private handleMessage;
+    private respond;
     private syncDoc;
+    /** 把一条 LSP Diagnostic（push 或 pull 两种来源共用）转成桥接的 wire 结构。 */
+    private toWireDiagnostic;
+    /** pull 模式诊断：请求 textDocument/diagnostic，非空就回调，空则节流重试（IntelliJ 分析异步）。 */
+    private pullDiagnostics;
 }

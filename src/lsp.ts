@@ -10,8 +10,9 @@
  * - server 崩溃后自动清理，30s 内不重启同语言。
  */
 import { spawn, type ChildProcess } from 'node:child_process'
-import { existsSync, readFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { existsSync, readFileSync, realpathSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { basename, dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 export type LspSeverity = 1 | 2 | 3 | 4 // error / warning / info / hint
@@ -31,6 +32,8 @@ interface LanguageConfig {
   languageId: string
   exts: string[]
   cmd: string[]
+  /** 该 server 的诊断为 pull 模式（textDocument/diagnostic 请求），而非推送 publishDiagnostics。 */
+  pullDiagnostics?: boolean
 }
 
 /** 语言 → server 命令（PATH 里找不到二进制时该语言自动禁用）。 */
@@ -40,7 +43,9 @@ const LANGS: Record<string, LanguageConfig> = {
   python: { languageId: 'python', exts: ['.py'], cmd: ['pyright-langserver', '--stdio'] },
   rust: { languageId: 'rust', exts: ['.rs'], cmd: ['rust-analyzer'] },
   cpp: { languageId: 'cpp', exts: ['.c', '.h', '.cc', '.cpp', '.hpp'], cmd: ['clangd'] },
-  kotlin: { languageId: 'kotlin', exts: ['.kt', '.kts'], cmd: ['kotlin-language-server', '--stdio'] },
+  // 官方 JetBrains Kotlin LSP（IntelliJ 内核）——二进制在 cmdFor 里按 DSH_KOTLIN_LSP_BIN →
+  // 内置解包路径 → PATH 上的 kotlin-lsp 三级解析；诊断是 pull 模式。
+  kotlin: { languageId: 'kotlin', exts: ['.kt', '.kts'], cmd: ['kotlin-lsp', '--stdio'], pullDiagnostics: true },
 }
 
 const DIAG_THROTTLE_MS = 400
@@ -57,6 +62,10 @@ interface ServerState {
   restartBlockedUntil: number
   /** initialize 完成即 resolve（didOpen/didChange 必须等它，否则 server 静默丢弃）。 */
   initPromise: Promise<void>
+  /** 诊断为 pull 模式（textDocument/diagnostic），同步后需主动请求。 */
+  pullDiagnostics: boolean
+  /** uri → LSP 文档版本号（didChange 的 version 必须是递增的小整数，Date.now 会溢出 IntelliJ 的 int）。 */
+  docVersions: Map<string, number>
 }
 
 export interface LspOptions {
@@ -143,7 +152,58 @@ export class LspManager {
   // ---- 内部 ----
 
   private cmdFor(lang: string): string[] {
-    return this.opts.cmdOverride?.[lang] ?? LANGS[lang].cmd
+    const override = this.opts.cmdOverride?.[lang]
+    if (override !== undefined) return override
+    if (lang === 'kotlin') return this.kotlinCmd()
+    return LANGS[lang].cmd
+  }
+
+  /**
+   * 官方 JetBrains Kotlin LSP 二进制三级解析：
+   * a. DSH_KOTLIN_LSP_BIN（绝对路径或 PATH 上的名字）；
+   * b. 解包在 ~/.dsh/kotlin-lsp/server/bin/intellij-server；
+   * c. PATH 上的 `kotlin-lsp`。
+   */
+  private kotlinBin(): string | undefined {
+    const env = process.env.DSH_KOTLIN_LSP_BIN
+    if (env !== undefined && env !== '') {
+      const hit = this.findExecutable(env)
+      if (hit !== undefined) return hit
+    }
+    const bundled = '/Users/xieshaoze/.dsh/kotlin-lsp/server/bin/intellij-server'
+    if (existsSync(bundled)) return bundled
+    return this.findExecutable('kotlin-lsp')
+  }
+
+  /** IntelliJ LSP 的索引/缓存目录（稳定路径，跨进程复用，避免每次重建索引）。 */
+  private kotlinIndexDir(): string {
+    return join(homedir(), '.dsh', 'kotlin-lsp', 'index')
+  }
+
+  /** Kotlin 需要项目根（含 build 文件）才能导入分析；找不到就退回文件所在目录。 */
+  private kotlinProjectRoot(path: string): string {
+    const markers = ['build.gradle.kts', 'build.gradle', 'settings.gradle.kts', 'settings.gradle', 'pom.xml']
+    let dir = dirname(path)
+    for (let i = 0; i < 20; i++) {
+      if (markers.some((m) => existsSync(join(dir, m)))) return dir
+      const parent = dirname(dir)
+      if (parent === dir) break
+      dir = parent
+    }
+    return dirname(path)
+  }
+
+  private kotlinCmd(): string[] {
+    const bin = this.kotlinBin()
+    if (bin === undefined) return ['kotlin-lsp', '--stdio'] // 找不到时让 findExecutable 记一次缺失日志
+    return [bin, '--stdio', '--system-path', this.kotlinIndexDir()]
+  }
+
+  /** 项目根里的构建系统：Gradle / Maven。用于显式 buildTools 触发 IntelliJ 的项目导入。 */
+  private kotlinBuildTool(root: string): string | undefined {
+    if (existsSync(join(root, 'build.gradle.kts')) || existsSync(join(root, 'build.gradle'))) return 'gradle'
+    if (existsSync(join(root, 'pom.xml'))) return 'maven'
+    return undefined
   }
 
   private langFor(path: string): string | undefined {
@@ -208,6 +268,8 @@ export class LspManager {
         dead: false,
         restartBlockedUntil: 0,
         initPromise: Promise.resolve(),
+        pullDiagnostics: LANGS[lang].pullDiagnostics === true,
+        docVersions: new Map(),
       }
       proc.on('error', (e) => {
         this.opts.log?.(`[lsp] ${lang} spawn 失败: ${String(e)}`)
@@ -233,14 +295,39 @@ export class LspManager {
         }
       })
       this.servers.set(lang, state)
-      // initialize（rootUri 用文件所在目录；capabilities 只用默认即可收到诊断）。
+      // initialize：rootUri 默认用文件所在目录。官方 Kotlin LSP 是 IntelliJ 内核：
+      // - 需要 workspaceFolders + 完整同步/诊断能力声明（否则索引/分析不启动）；
+      // - 需要项目根（含 build 文件）才能导入出 content root，松散 .kt 文件会被
+      //   KotlinProblemHighlightFilter 判定为 not-under-content-root 而返回 0 诊断；
+      // - 诊断是 pull 模式（diagnosticProvider），由 syncDoc 主动 textDocument/diagnostic 拉取。
       // didOpen/didChange 一律等 initPromise，否则 server 会静默丢弃初始化前通知。
+      const isKotlin = lang === 'kotlin'
+      const isTs = lang === 'typescript' || lang === 'javascript'
+      // Kotlin 的 workspace root 用项目根（含 build 文件），并解析符号链接（macOS /tmp→/private/tmp），
+      // 否则 buildTools 的 key 与 server 解析出的文件夹 URI 对不上，导入不会触发。
+      let kotlinRoot = isKotlin ? this.kotlinProjectRoot(path) : dirname(path)
+      if (isKotlin) {
+        try { kotlinRoot = realpathSync(kotlinRoot) } catch { /* 保留未解析路径 */ }
+      }
+      const kotlinRootUri = pathToFileURL(kotlinRoot).href
+      const kotlinTool = isKotlin ? this.kotlinBuildTool(kotlinRoot) : undefined
+      const kotlinInitOptions: Record<string, unknown> = { indexDir: this.kotlinIndexDir() }
+      if (kotlinTool !== undefined) kotlinInitOptions.buildTools = { [kotlinRootUri]: kotlinTool }
       state.initPromise = this.request(state, 'initialize', {
-        processId: process.pid,
-        rootUri: pathToFileURL(dirname(path)).href,
+        processId: isKotlin ? null : process.pid,
+        rootUri: kotlinRootUri,
+        ...(isKotlin ? { rootPath: kotlinRoot } : {}),
+        ...(isKotlin ? { workspaceFolders: [{ uri: kotlinRootUri, name: basename(kotlinRoot) }] } : {}),
         // 声明 publishDiagnostics 能力：否则 ts-language-server 可能静默切换诊断拉取模式
-        capabilities: { textDocument: { publishDiagnostics: { relatedInformation: true } } },
-        ...(lang === 'typescript' || lang === 'javascript'
+        capabilities: {
+          textDocument: {
+            publishDiagnostics: { relatedInformation: true },
+            ...(isKotlin ? { synchronization: { didSave: true, willSave: true }, diagnostic: { relatedInformation: true } } : {}),
+          },
+          ...(isKotlin ? { workspace: { workspaceFolders: true, configuration: true }, window: { workDoneProgress: true } } : {}),
+        },
+        ...(isKotlin ? { initializationOptions: kotlinInitOptions } : {}),
+        ...(isTs
           ? (() => {
               const tsp = this.tsserverPath()
               return tsp !== undefined
@@ -249,7 +336,8 @@ export class LspManager {
             })()
           : {}),
       }).then(() => {
-        if (!state.dead) this.send(state, 'initialized', {})
+        // initialized 是通知不是请求：带 id 会让 IntelliJ LSP 报 "no handler for request: initialized" 并跳过项目导入
+        if (!state.dead) this.notify(state, 'initialized', {})
       }).catch((e) => {
         this.opts.log?.(`[lsp] ${lang} 初始化失败: ${String(e)}`)
       })
@@ -265,13 +353,6 @@ export class LspManager {
     state.dead = true
     try { state.proc.kill() } catch { /* 忽略 */ }
     state.pending.clear()
-  }
-
-  private send(state: ServerState, method: string, params: unknown): void {
-    if (state.dead) return
-    const id = state.nextId++
-    const frame = JSON.stringify({ jsonrpc: '2.0', id, method, params })
-    state.proc.stdin?.write(`Content-Length: ${Buffer.byteLength(frame)}\r\n\r\n${frame}`)
   }
 
   private notify(state: ServerState, method: string, params: unknown): void {
@@ -308,22 +389,18 @@ export class LspManager {
       if (typeof p.uri !== 'string' || !Array.isArray(p.diagnostics)) return
       const path = fileURLToPath(p.uri)
       const diags = (p.diagnostics as Array<Record<string, unknown>>)
-        .map((d): LspDiagnosticWire | null => {
-          const r = (d.range ?? {}) as { start?: { line?: number; character?: number }; end?: { line?: number; character?: number } }
-          if (r.start === undefined || typeof d.message !== 'string') return null
-          return {
-            path,
-            line: (r.start.line ?? 0) + 1,
-            column: (r.start.character ?? 0) + 1,
-            ...(r.end !== undefined ? { endLine: (r.end.line ?? 0) + 1, endColumn: (r.end.character ?? 0) + 1 } : {}),
-            severity: (typeof d.severity === 'number' ? (d.severity as LspSeverity) : 3),
-            message: d.message.slice(0, 500),
-            ...(typeof d.source === 'string' ? { source: d.source } : {}),
-          }
-        })
+        .map((d) => this.toWireDiagnostic(path, d))
         .filter((d): d is LspDiagnosticWire => d !== null)
         .slice(0, 200)
       this.opts.onDiagnostics(path, state.docSessions.get(p.uri), diags)
+      return
+    }
+    if (msg.method === 'intellij/ready-for-test') {
+      // IntelliJ 索引 + 分析就绪（首次项目导入可能要几分钟）：此时对已打开文档重新拉一次 pull 诊断，
+      // 否则 syncDoc 后那几秒的重试会在分析就绪前就耗尽，导致首屏诊断为空。
+      if (state.pullDiagnostics) {
+        for (const uri of state.openDocs.keys()) this.pullDiagnostics(state, uri, 3)
+      }
       return
     }
     if (msg.id !== undefined && typeof msg.id === 'number') {
@@ -331,8 +408,18 @@ export class LspManager {
       if (cb !== undefined) {
         state.pending.delete(msg.id)
         cb(msg.result)
+      } else if (typeof msg.method === 'string') {
+        // 服务器发起的请求（如 window/workDoneProgress/create）：必须回应 null，
+        // 否则 IntelliJ LSP 会一直等进度令牌、跳过项目导入。
+        this.respond(state, msg.id, null)
       }
     }
+  }
+
+  private respond(state: ServerState, id: number, result: unknown): void {
+    if (state.dead) return
+    const frame = JSON.stringify({ jsonrpc: '2.0', id, result })
+    state.proc.stdin?.write(`Content-Length: ${Buffer.byteLength(frame)}\r\n\r\n${frame}`)
   }
 
   private syncDoc(state: ServerState, uri: string, path: string): void {
@@ -346,10 +433,52 @@ export class LspManager {
     const prev = state.openDocs.get(uri)
     if (prev === text) return
     state.openDocs.set(uri, text)
+    const version = (state.docVersions.get(uri) ?? 1) + 1
+    state.docVersions.set(uri, version)
     this.notify(state, 'textDocument/didChange', {
-      textDocument: { uri, version: Date.now() },
+      textDocument: { uri, version },
       contentChanges: [{ text }],
     })
+    // 官方 Kotlin LSP 的诊断是 pull 模式（diagnosticProvider）：不会推送 publishDiagnostics，
+    // 必须主动 textDocument/diagnostic 拉取。IntelliJ 分析是异步的，空结果时稍后重试。
+    if (state.pullDiagnostics) this.pullDiagnostics(state, uri)
+  }
+
+  /** 把一条 LSP Diagnostic（push 或 pull 两种来源共用）转成桥接的 wire 结构。 */
+  private toWireDiagnostic(path: string, d: Record<string, unknown>): LspDiagnosticWire | null {
+    const r = (d.range ?? {}) as { start?: { line?: number; character?: number }; end?: { line?: number; character?: number } }
+    if (r.start === undefined || typeof d.message !== 'string') return null
+    return {
+      path,
+      line: (r.start.line ?? 0) + 1,
+      column: (r.start.character ?? 0) + 1,
+      ...(r.end !== undefined ? { endLine: (r.end.line ?? 0) + 1, endColumn: (r.end.character ?? 0) + 1 } : {}),
+      severity: (typeof d.severity === 'number' ? (d.severity as LspSeverity) : 3),
+      message: d.message.slice(0, 500),
+      ...(typeof d.source === 'string' ? { source: d.source } : {}),
+    }
+  }
+
+  /** pull 模式诊断：请求 textDocument/diagnostic，非空就回调，空则节流重试（IntelliJ 分析异步）。 */
+  private pullDiagnostics(state: ServerState, uri: string, attempts = 4): void {
+    if (state.dead || attempts <= 0) return
+    void this.request(state, 'textDocument/diagnostic', { textDocument: { uri } })
+      .then((result) => {
+        if (state.dead) return
+        const items = (result as { items?: unknown } | undefined)?.items
+        if (!Array.isArray(items)) return
+        const path = fileURLToPath(uri)
+        const diags = (items as Array<Record<string, unknown>>)
+          .map((d) => this.toWireDiagnostic(path, d))
+          .filter((d): d is LspDiagnosticWire => d !== null)
+          .slice(0, 200)
+        if (diags.length > 0) {
+          this.opts.onDiagnostics(path, state.docSessions.get(uri), diags)
+        } else {
+          setTimeout(() => this.pullDiagnostics(state, uri, attempts - 1), 1500)
+        }
+      })
+      .catch(() => { /* 分析尚未就绪等瞬时错误忽略，等待下次同步再拉 */ })
   }
 }
 
