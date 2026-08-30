@@ -123,6 +123,7 @@ export function apply(ctx: Context) {
   pairPrune.unref?.()
 
   // ---- 启动自检：版本 + 待办恢复（重启后自动续跑，不等客户端来问）----
+  const bootedAt = Date.now()
   const bootWork = loadWorkState(WORK_FILE)
   const recentClients = devices.filter((d) => d.lastSeenAt !== undefined && Date.now() - d.lastSeenAt < 24 * 3600_000)
   logger.info('BOOT', `bridge ${BRIDGE_VERSION} 启动完成 serverId=${serverId.slice(0, 8)} host=${host} 会话=${ctx.sessions.list().length} 已配对设备=${devices.length}（24h 内活跃 ${recentClients.length}）`)
@@ -1123,6 +1124,14 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
     void snapshot().then((snap) => {
       send(ws, snap)
       logger.debug('WS', `已推送 hello 快照 (sessions=${snap.sessions.length})`)
+      // 重启通知：客户端重连即告知「服务端已重启 + 版本 + 新增功能」，免去客户端来问
+      const work = loadWorkState(WORK_FILE)
+      send(ws, {
+        type: 'server_boot',
+        version: BRIDGE_VERSION,
+        bootedAt,
+        notes: work?.notes ?? [],
+      })
     })
     ws.on('pong', () => {
       wsState(ws).alive = true
@@ -1190,7 +1199,7 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
       if (req.method === 'PUT' || req.method === 'POST') {
         let body = ''
         for await (const chunk of req) body += typeof chunk === 'string' ? chunk : chunk.toString()
-        let parsed: { activity?: string | null; pending?: string[] }
+        let parsed: { activity?: string | null; pending?: string[]; notes?: string[] }
         try {
           parsed = JSON.parse(body) as typeof parsed
         } catch {
@@ -1200,6 +1209,7 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
         const state = writeWorkState(WORK_FILE, {
           ...(parsed.activity !== undefined ? { activity: parsed.activity } : {}),
           ...(parsed.pending !== undefined ? { pending: parsed.pending } : {}),
+          ...(parsed.notes !== undefined ? { notes: parsed.notes } : {}),
         })
         logger.info('WORK', `工作状态更新：activity="${state.activity ?? '-'}" pending=${state.pending.length}`)
         json(res, state)

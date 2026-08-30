@@ -301,6 +301,13 @@ export interface LspDiagnosticWire {
     message: string;
     source?: string;
 }
+/** 服务端重启通知：客户端重连后推送（版本 + 启动时间 + 新增功能说明）。 */
+export interface EvServerBoot {
+    type: 'server_boot';
+    version: string;
+    bootedAt: number;
+    notes: string[];
+}
 /** A session's durable title changed (user rename or automatic generation). */
 export interface EvSessionTitle {
     type: 'session_title';
@@ -335,7 +342,7 @@ export interface EvDeviceRevoked {
     type: 'device_revoked';
     deviceId: string;
 }
-export type ServerEvent = EvHello | EvSessions | EvAgents | EvEvent | EvHistory | EvSessionQueue | EvLogsRequest | EvModelWaiting | EvModelWaitingDone | EvThinkDelta | EvDiagnostics | EvSessionTitle | EvSessionUpsert | EvAgentStatus | EvApprovalRequest | EvApprovalResolved | EvQuestionRequest | EvQuestionResolved | EvError | EvDeviceRegistered | EvDeviceRevoked;
+export type ServerEvent = EvHello | EvSessions | EvAgents | EvEvent | EvHistory | EvSessionQueue | EvLogsRequest | EvModelWaiting | EvModelWaitingDone | EvThinkDelta | EvDiagnostics | EvServerBoot | EvSessionTitle | EvSessionUpsert | EvAgentStatus | EvApprovalRequest | EvApprovalResolved | EvQuestionRequest | EvQuestionResolved | EvError | EvDeviceRegistered | EvDeviceRevoked;
 export interface PingInfo {
     ok: true;
     version: string;
@@ -364,4 +371,4 @@ export interface DeviceRecord {
     createdAt: number;
     lastSeenAt: number;
 }
-export declare const BRIDGE_VERSION = "0.11.1";
+export declare const BRIDGE_VERSION = "0.11.2";

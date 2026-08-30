@@ -14,6 +14,8 @@ export interface WorkState {
   activity: string | null
   /** 待办清单（重启后按序继续）。 */
   pending: string[]
+  /** 最近一次重启的新增功能说明（推送给重连客户端展示）。 */
+  notes: string[]
   updatedAt: number
 }
 
@@ -24,6 +26,7 @@ export function loadWorkState(file: string): WorkState | null {
     return {
       activity: typeof parsed.activity === 'string' ? parsed.activity : null,
       pending: Array.isArray(parsed.pending) ? parsed.pending.filter((p): p is string => typeof p === 'string') : [],
+      notes: Array.isArray(parsed.notes) ? parsed.notes.filter((p): p is string => typeof p === 'string') : [],
       updatedAt: typeof parsed.updatedAt === 'number' ? parsed.updatedAt : 0,
     }
   } catch {
@@ -31,11 +34,12 @@ export function loadWorkState(file: string): WorkState | null {
   }
 }
 
-export function writeWorkState(file: string, patch: { activity?: string | null; pending?: string[] }): WorkState {
-  const current = loadWorkState(file) ?? { activity: null, pending: [], updatedAt: 0 }
+export function writeWorkState(file: string, patch: { activity?: string | null; pending?: string[]; notes?: string[] }): WorkState {
+  const current = loadWorkState(file) ?? { activity: null, pending: [], notes: [], updatedAt: 0 }
   const next: WorkState = {
     activity: patch.activity !== undefined ? patch.activity : current.activity,
     pending: patch.pending !== undefined ? patch.pending : current.pending,
+    notes: patch.notes !== undefined ? patch.notes : current.notes,
     updatedAt: Date.now(),
   }
   mkdirSync(dirname(file), { recursive: true })
