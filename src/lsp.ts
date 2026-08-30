@@ -68,6 +68,8 @@ interface ServerState {
   docVersions: Map<string, number>
   /** 当前 workspace 根（回应 workspace/workspaceFolders 请求用）。 */
   workspaceFolders: Array<{ uri: string; name: string }>
+  /** 解析后的 uri → 调用方原始路径（诊断回调要回原路径，而不是 realpath 后的 /private/tmp）。 */
+  docPaths: Map<string, string>
 }
 
 export interface LspOptions {
@@ -101,12 +103,17 @@ export class LspManager {
   notifyFileChanged(path: string, sessionId?: string): void {
     if (!path.startsWith('/')) return // 只处理绝对路径
     if (!existsSync(path)) return
+    const originalPath = path
+    // 解析符号链接（macOS /tmp→/private/tmp）：否则 file URI 与 IntelliJ server 解析出的 VFS 路径对不上，
+    // didOpen/didChange 会落到错误的 URI，诊断请求 findVirtualFile 返回空 → 0 诊断。
+    try { path = realpathSync(path) } catch { /* 保留原路径 */ }
     const lang = this.langFor(path)
     if (lang === undefined) return
     if (this.missing.has(lang)) return
     const state = this.ensureServer(lang, path)
     if (state === undefined) return
     const uri = pathToFileURL(path).href
+    state.docPaths.set(uri, originalPath)
     // LSP 规定 didOpen 等通知必须在 initialize 完成之后：初始化未就绪先入队
     void state.initPromise.then(() => {
       if (state.dead) return
@@ -132,6 +139,7 @@ export class LspManager {
 
   /** 立即同步一次文件内容（绕过节流，供测试）。 */
   flush(path: string): void {
+    try { path = realpathSync(path) } catch { /* 保留原路径 */ }
     const t = this.diagTimers.get(path)
     if (t !== undefined) {
       clearTimeout(t)
@@ -266,7 +274,6 @@ export class LspManager {
    * IntelliJ 不完整启用分析/索引。这里覆盖诊断 + hover/definition/references（query 用）。
    */
   private kotlinCapabilities(): Record<string, unknown> {
-    const symKind = { valueSet: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26] }
     return {
       textDocument: {
         synchronization: { didSave: true, dynamicRegistration: false, willSave: false, willSaveWaitUntil: false },
@@ -358,6 +365,7 @@ export class LspManager {
         pullDiagnostics: LANGS[lang].pullDiagnostics === true,
         docVersions: new Map(),
         workspaceFolders: [{ uri: pathToFileURL(dirname(path)).href, name: basename(dirname(path)) }],
+        docPaths: new Map(),
       }
       proc.on('error', (e) => {
         this.opts.log?.(`[lsp] ${lang} spawn 失败: ${String(e)}`)
@@ -401,6 +409,7 @@ export class LspManager {
       const kotlinTool = isKotlin ? this.kotlinBuildTool(kotlinRoot) : undefined
       const kotlinInitOptions: Record<string, unknown> = { indexDir: this.kotlinIndexDir() }
       if (kotlinTool !== undefined) kotlinInitOptions.buildTools = { [kotlinRootUri]: kotlinTool }
+      if (isKotlin) state.workspaceFolders = [{ uri: kotlinRootUri, name: basename(kotlinRoot) }]
       state.initPromise = this.request(state, 'initialize', {
         processId: isKotlin ? null : process.pid,
         rootUri: kotlinRootUri,
@@ -475,7 +484,7 @@ export class LspManager {
     if (msg.method === 'textDocument/publishDiagnostics') {
       const p = (msg.params ?? {}) as { uri?: unknown; diagnostics?: unknown }
       if (typeof p.uri !== 'string' || !Array.isArray(p.diagnostics)) return
-      const path = fileURLToPath(p.uri)
+      const path = state.docPaths.get(p.uri) ?? fileURLToPath(p.uri)
       const diags = (p.diagnostics as Array<Record<string, unknown>>)
         .map((d) => this.toWireDiagnostic(path, d))
         .filter((d): d is LspDiagnosticWire => d !== null)
@@ -485,10 +494,17 @@ export class LspManager {
       return
     }
     if (msg.method === 'intellij/ready-for-test') {
-      // IntelliJ 索引 + 分析就绪（首次项目导入可能要几分钟）：此时对已打开文档重新拉一次 pull 诊断，
-      // 否则 syncDoc 后那几秒的重试会在分析就绪前就耗尽，导致首屏诊断为空。
+      // IntelliJ 索引 + 分析就绪（首次项目导入可能要几分钟，且 ready 后仍需 ~20s 才算完）：
+      // 项目导入会重建 analyzer project，可能丢掉导入前 didChange 的文档内容——这里对每个已打开文档
+      // 强制重发一次 didChange（全量内容）+ 用更长重试窗口重新拉 pull 诊断。
       if (state.pullDiagnostics) {
-        for (const uri of state.openDocs.keys()) this.pullDiagnostics(state, uri, 3)
+        this.opts.log?.(`[lsp] ${lang} ready-for-test，重新同步并拉取诊断（${state.openDocs.size} 个文档）`)
+        for (const [uri, text] of state.openDocs) {
+          const version = (state.docVersions.get(uri) ?? 1) + 1
+          state.docVersions.set(uri, version)
+          this.notify(state, 'textDocument/didChange', { textDocument: { uri, version }, contentChanges: [{ text }] })
+          this.pullDiagnostics(state, uri, 20, 3000)
+        }
       }
       return
     }
@@ -498,10 +514,32 @@ export class LspManager {
         state.pending.delete(msg.id)
         cb(msg.result)
       } else if (typeof msg.method === 'string') {
-        // 服务器发起的请求（如 window/workDoneProgress/create）：必须回应 null，
-        // 否则 IntelliJ LSP 会一直等进度令牌、跳过项目导入。
-        this.respond(state, msg.id, null)
+        this.handleServerRequest(state, msg.id, msg.method, msg.params)
       }
+    }
+  }
+
+  /** 回应服务器发起的请求（oh-my-pi 同款：workspace/configuration 与 workspace/workspaceFolders 必须回数组）。 */
+  private handleServerRequest(state: ServerState, id: number, method: string, params: unknown): void {
+    switch (method) {
+      case 'workspace/configuration': {
+        // server 拉取设置（如 intellij.buildTool）：按请求项返回 null 数组
+        const items = (params as { items?: Array<{ section?: string }> } | undefined)?.items ?? []
+        this.respond(state, id, items.map(() => null))
+        return
+      }
+      case 'workspace/workspaceFolders':
+        this.respond(state, id, state.workspaceFolders)
+        return
+      case 'workspace/applyEdit':
+        this.respond(state, id, { applied: false })
+        return
+      case 'window/showDocument':
+        this.respond(state, id, { success: false })
+        return
+      default:
+        // window/workDoneProgress/create、client/registerCapability、window/showMessageRequest、各种 refresh 等
+        this.respond(state, id, null)
     }
   }
 
@@ -548,24 +586,25 @@ export class LspManager {
     }
   }
 
-  /** pull 模式诊断：请求 textDocument/diagnostic，非空就回调，空则节流重试（IntelliJ 分析异步）。 */
-  private pullDiagnostics(state: ServerState, uri: string, attempts = 4): void {
+  /** pull 模式诊断：请求 textDocument/diagnostic，非空就回调，空则节流重试（IntelliJ 分析异步，就绪后仍需 20~30s 才算完）。 */
+  private pullDiagnostics(state: ServerState, uri: string, attempts = 4, delayMs = 3000): void {
     if (state.dead || attempts <= 0) return
     void this.request(state, 'textDocument/diagnostic', { textDocument: { uri } })
       .then((result) => {
         if (state.dead) return
         const items = (result as { items?: unknown } | undefined)?.items
         if (!Array.isArray(items)) return
-        const path = fileURLToPath(uri)
+        const path = state.docPaths.get(uri) ?? fileURLToPath(uri)
         const diags = (items as Array<Record<string, unknown>>)
           .map((d) => this.toWireDiagnostic(path, d))
           .filter((d): d is LspDiagnosticWire => d !== null)
           .slice(0, 200)
         this.diagCache.set(uri, diags)
         if (diags.length > 0) {
+          this.opts.log?.(`[lsp] pull 诊断 ${diags.length} 条：${diags[0].message.slice(0, 80)}`)
           this.opts.onDiagnostics(path, state.docSessions.get(uri), diags)
         } else {
-          setTimeout(() => this.pullDiagnostics(state, uri, attempts - 1), 1500)
+          setTimeout(() => this.pullDiagnostics(state, uri, attempts - 1, delayMs), delayMs)
         }
       })
       .catch(() => { /* 分析尚未就绪等瞬时错误忽略，等待下次同步再拉 */ })

@@ -54,6 +54,11 @@ export declare class LspManager {
     private kotlinCmd;
     /** 项目根里的构建系统：Gradle / Maven。用于显式 buildTools 触发 IntelliJ 的项目导入。 */
     private kotlinBuildTool;
+    /**
+     * 官方 IntelliJ Kotlin LSP 需要全量能力声明（oh-my-pi 同款）：只声明 publishDiagnostics 会让
+     * IntelliJ 不完整启用分析/索引。这里覆盖诊断 + hover/definition/references（query 用）。
+     */
+    private kotlinCapabilities;
     private langFor;
     /** 全局 typescript 安装里的 tsserver.js（typescript-language-server 不捆绑 typescript 时需要显式指路）。 */
     private tsserverPath;
@@ -63,10 +68,12 @@ export declare class LspManager {
     private notify;
     private request;
     private handleMessage;
+    /** 回应服务器发起的请求（oh-my-pi 同款：workspace/configuration 与 workspace/workspaceFolders 必须回数组）。 */
+    private handleServerRequest;
     private respond;
     private syncDoc;
     /** 把一条 LSP Diagnostic（push 或 pull 两种来源共用）转成桥接的 wire 结构。 */
     private toWireDiagnostic;
-    /** pull 模式诊断：请求 textDocument/diagnostic，非空就回调，空则节流重试（IntelliJ 分析异步）。 */
+    /** pull 模式诊断：请求 textDocument/diagnostic，非空就回调，空则节流重试（IntelliJ 分析异步，就绪后仍需 20~30s 才算完）。 */
     private pullDiagnostics;
 }
