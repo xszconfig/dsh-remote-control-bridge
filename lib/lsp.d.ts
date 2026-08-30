@@ -22,6 +22,7 @@ export declare class LspManager {
     private readonly servers;
     private readonly missing;
     private readonly diagTimers;
+    private tsServerPathCache;
     constructor(opts: LspOptions);
     /** 已就绪（二进制存在）的语言列表，hello 快照里下发给手机。 */
     availableLangs(): string[];
@@ -32,6 +33,8 @@ export declare class LspManager {
     dispose(): void;
     private cmdFor;
     private langFor;
+    /** 全局 typescript 安装里的 tsserver.js（typescript-language-server 不捆绑 typescript 时需要显式指路）。 */
+    private tsserverPath;
     private findExecutable;
     private ensureServer;
     private killServer;

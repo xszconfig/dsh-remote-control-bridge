@@ -11,7 +11,7 @@
  */
 import { spawn, type ChildProcess } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
 export type LspSeverity = 1 | 2 | 3 | 4 // error / warning / info / hint
@@ -52,6 +52,8 @@ interface ServerState {
   openDocs: Map<string, string>
   dead: boolean
   restartBlockedUntil: number
+  /** initialize 完成即 resolve（didOpen/didChange 必须等它，否则 server 静默丢弃）。 */
+  initPromise: Promise<void>
 }
 
 export interface LspOptions {
@@ -67,6 +69,7 @@ export class LspManager {
   private readonly servers = new Map<string, ServerState>()
   private readonly missing = new Set<string>() // 二进制缺失的语言
   private readonly diagTimers = new Map<string, NodeJS.Timeout>()
+  private tsServerPathCache: string | null | undefined // undefined=未探测 null=没有
 
   constructor(private readonly opts: LspOptions) {}
 
@@ -89,20 +92,24 @@ export class LspManager {
     const state = this.ensureServer(lang, path)
     if (state === undefined) return
     const uri = pathToFileURL(path).href
-    const doc = state.openDocs.get(uri)
-    if (doc === undefined) {
-      state.openDocs.set(uri, '')
-      this.send(state, 'textDocument/didOpen', {
-        textDocument: { uri, languageId: LANGS[lang].languageId, version: 1, text: '' },
-      })
-    }
-    // 全量同步：读盘节流后发出（首次 didOpen 后立即同步一次内容）
-    const prev = this.diagTimers.get(path)
-    if (prev !== undefined) clearTimeout(prev)
-    this.diagTimers.set(path, setTimeout(() => {
-      this.diagTimers.delete(path)
-      this.syncDoc(state, uri, path)
-    }, DIAG_THROTTLE_MS))
+    // LSP 规定 didOpen 等通知必须在 initialize 完成之后：初始化未就绪先入队
+    void state.initPromise.then(() => {
+      if (state.dead) return
+      const doc = state.openDocs.get(uri)
+      if (doc === undefined) {
+        state.openDocs.set(uri, '')
+        this.notify(state, 'textDocument/didOpen', {
+          textDocument: { uri, languageId: LANGS[lang].languageId, version: 1, text: '' },
+        })
+      }
+      // 全量同步：读盘节流后发出（首次 didOpen 后立即同步一次内容）
+      const prev = this.diagTimers.get(path)
+      if (prev !== undefined) clearTimeout(prev)
+      this.diagTimers.set(path, setTimeout(() => {
+        this.diagTimers.delete(path)
+        this.syncDoc(state, uri, path)
+      }, DIAG_THROTTLE_MS))
+    })
   }
 
   /** 立即同步一次文件内容（绕过节流，供测试）。 */
@@ -143,6 +150,23 @@ export class LspManager {
     return undefined
   }
 
+  /** 全局 typescript 安装里的 tsserver.js（typescript-language-server 不捆绑 typescript 时需要显式指路）。 */
+  private tsserverPath(): string | undefined {
+    if (this.tsServerPathCache !== undefined) return this.tsServerPathCache ?? undefined
+    const candidates: string[] = []
+    if (process.env.DSH_TSSERVER_PATH !== undefined) candidates.push(process.env.DSH_TSSERVER_PATH)
+    const bin = this.findExecutable('typescript-language-server')
+    if (bin !== undefined) {
+      const globalRoot = join(dirname(dirname(bin)), 'lib', 'node_modules')
+      candidates.push(join(globalRoot, 'typescript', 'lib', 'tsserver.js'))
+    }
+    candidates.push('/opt/homebrew/lib/node_modules/typescript/lib/tsserver.js')
+    candidates.push('/usr/local/lib/node_modules/typescript/lib/tsserver.js')
+    const hit = candidates.find((c) => c !== '' && existsSync(c))
+    this.tsServerPathCache = hit ?? null
+    return hit
+  }
+
   private findExecutable(bin: string): string | undefined {
     if (bin.includes('/')) return existsSync(bin) ? bin : undefined
     const dirs = (process.env.PATH ?? '').split(':')
@@ -176,6 +200,7 @@ export class LspManager {
         openDocs: new Map(),
         dead: false,
         restartBlockedUntil: 0,
+        initPromise: Promise.resolve(),
       }
       proc.on('error', (e) => {
         this.opts.log?.(`[lsp] ${lang} spawn 失败: ${String(e)}`)
@@ -201,15 +226,25 @@ export class LspManager {
         }
       })
       this.servers.set(lang, state)
-      // initialize（rootUri 用文件所在目录；capabilities 只用默认即可收到诊断）
-      this.request(state, 'initialize', {
+      // initialize（rootUri 用文件所在目录；capabilities 只用默认即可收到诊断）。
+      // didOpen/didChange 一律等 initPromise，否则 server 会静默丢弃初始化前通知。
+      state.initPromise = this.request(state, 'initialize', {
         processId: process.pid,
         rootUri: pathToFileURL(dirname(path)).href,
-        capabilities: {},
+        // 声明 publishDiagnostics 能力：否则 ts-language-server 可能静默切换诊断拉取模式
+        capabilities: { textDocument: { publishDiagnostics: { relatedInformation: true } } },
+        ...(lang === 'typescript' || lang === 'javascript'
+          ? (() => {
+              const tsp = this.tsserverPath()
+              return tsp !== undefined
+                ? { initializationOptions: { tsserver: { path: tsp } } }
+                : {}
+            })()
+          : {}),
       }).then(() => {
         if (!state.dead) this.send(state, 'initialized', {})
-      }).catch(() => {
-        // 初始化失败：server 可能不支持该 root；保持存活等诊断（多数 server 容忍）
+      }).catch((e) => {
+        this.opts.log?.(`[lsp] ${lang} 初始化失败: ${String(e)}`)
       })
       return state
     } catch (e) {
