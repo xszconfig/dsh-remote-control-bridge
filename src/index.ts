@@ -17,6 +17,7 @@ import type {} from '@deepseek-ai/dsh-session-title'
 import type {} from '@deepseek-ai/dsh-workspace'
 import type {} from '@deepseek-ai/dsh-session-persistence'
 import type {} from '@deepseek-ai/dsh-tools'
+import { LspManager } from './lsp.js'
 
 import {
   BRIDGE_VERSION,
@@ -25,8 +26,7 @@ import {
   type ClientCommand,
   type DeviceRecord,
   type DiffWire,
-  type EventProjection,
-  type EvHello,
+  type EventProjection,  type EvHello,
   type LogEntryWire,
   type PairInfo,
   type QuestionRequestWire,
@@ -301,6 +301,7 @@ export function apply(ctx: Context) {
     pendingApprovals: pendingApprovalList(),
     pendingRemoteApprovals: [...muxRemoteApprovals.values()],
     pendingQuestions: [...muxQuestions.values()],
+    lsp: { languages: lsp.availableLangs() },
   })
 
   // 广播统计：每 5s 聚合输出一次「下行推送 X 条 → Y 客户端」，
@@ -334,6 +335,14 @@ export function apply(ctx: Context) {
   const send = (ws: WebSocket, ev: ServerEvent): void => {
     if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(ev))
   }
+
+  // ---- LSP 代码智能：Agent 编辑文件 → Language Server 诊断 → 广播到手机 ----
+  const lsp = new LspManager({
+    onDiagnostics: (path, diagnostics) => {
+      broadcast({ type: 'diagnostics', path, diagnostics })
+    },
+    log: (m) => logger.debug('LSP', m),
+  })
 
   // ---- 历史分页（尾部优先 + 按 seq 翻页）----
 
@@ -464,6 +473,10 @@ export function apply(ctx: Context) {
     const scope = ctx.agents.get(session.id)
     for (const proj of projectEvent(ctx, event, scope)) {
       broadcast({ type: 'event', sessionId: String(session.id), event: proj })
+    }
+    // LSP：实时事件里 Agent 编辑/写入文件 → 触发语言诊断（历史投影不触发，避免重放风暴）
+    if (event.type === 'tool/call') {
+      for (const p of toolFilePaths(event.data)) lsp.notifyFileChanged(p)
     }
   })
 
@@ -1515,6 +1528,25 @@ const TOOL_RESULT_MAX_CHARS = 4000
 function truncateResult(text: string): string {
   if (text.length <= TOOL_RESULT_MAX_CHARS) return text
   return `${text.slice(0, TOOL_RESULT_MAX_CHARS)}\n…(已截断，共 ${text.length} 字符)`
+}
+
+/** 从编辑/写入类工具的参数里提取被修改的绝对文件路径（LSP 诊断触发用）。 */
+function toolFilePaths(data: { name?: unknown; arguments?: unknown }): string[] {
+  if (data.name !== 'edit' && data.name !== 'write' && data.name !== 'str_replace_editor') return []
+  const raw = data.arguments
+  let args: unknown
+  try {
+    args = typeof raw === 'string' ? JSON.parse(raw) : raw
+  } catch {
+    return []
+  }
+  if (args === null || typeof args !== 'object') return []
+  const out: string[] = []
+  for (const k of ['file_path', 'path']) {
+    const v = (args as Record<string, unknown>)[k]
+    if (typeof v === 'string' && v.startsWith('/')) out.push(v)
+  }
+  return out
 }
 
 /**

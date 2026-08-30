@@ -190,6 +190,10 @@ export interface EvHello {
     pendingRemoteApprovals: ApprovalRequestWire[];
     /** 桌面端持有、bridge 经 mux 转发的提问（手机回答走 answer_question）。 */
     pendingQuestions: QuestionRequestWire[];
+    /** LSP 代码智能状态：语言 → 是否可用（server 二进制已安装）。 */
+    lsp?: {
+        languages: string[];
+    };
 }
 export interface EvSessions {
     type: 'sessions';
@@ -275,6 +279,23 @@ export interface EvThinkDelta {
     sessionId: string;
     text: string;
 }
+/** LSP 诊断推送：某文件的最新诊断集合（空数组 = 该文件已无问题）。 */
+export interface EvDiagnostics {
+    type: 'diagnostics';
+    path: string;
+    diagnostics: LspDiagnosticWire[];
+}
+/** LSP 单条诊断（位置 1-based；severity 1=error 2=warning 3=info 4=hint）。 */
+export interface LspDiagnosticWire {
+    path: string;
+    line: number;
+    column: number;
+    endLine?: number;
+    endColumn?: number;
+    severity: 1 | 2 | 3 | 4;
+    message: string;
+    source?: string;
+}
 /** A session's durable title changed (user rename or automatic generation). */
 export interface EvSessionTitle {
     type: 'session_title';
@@ -309,7 +330,7 @@ export interface EvDeviceRevoked {
     type: 'device_revoked';
     deviceId: string;
 }
-export type ServerEvent = EvHello | EvSessions | EvAgents | EvEvent | EvHistory | EvSessionQueue | EvLogsRequest | EvModelWaiting | EvModelWaitingDone | EvThinkDelta | EvSessionTitle | EvSessionUpsert | EvAgentStatus | EvApprovalRequest | EvApprovalResolved | EvQuestionRequest | EvQuestionResolved | EvError | EvDeviceRegistered | EvDeviceRevoked;
+export type ServerEvent = EvHello | EvSessions | EvAgents | EvEvent | EvHistory | EvSessionQueue | EvLogsRequest | EvModelWaiting | EvModelWaitingDone | EvThinkDelta | EvDiagnostics | EvSessionTitle | EvSessionUpsert | EvAgentStatus | EvApprovalRequest | EvApprovalResolved | EvQuestionRequest | EvQuestionResolved | EvError | EvDeviceRegistered | EvDeviceRevoked;
 export interface PingInfo {
     ok: true;
     version: string;
@@ -338,4 +359,4 @@ export interface DeviceRecord {
     createdAt: number;
     lastSeenAt: number;
 }
-export declare const BRIDGE_VERSION = "0.10.9";
+export declare const BRIDGE_VERSION = "0.11.0";
