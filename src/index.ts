@@ -130,7 +130,32 @@ export function apply(ctx: Context) {
   if (bootWork !== null && (bootWork.activity !== null || bootWork.pending.length > 0)) {
     logger.info('WORK', `待办恢复：活动="${bootWork.activity ?? '-'}" · 待办 ${bootWork.pending.length} 条`)
     for (const p of bootWork.pending) logger.info('WORK', `  - ${p}`)
-    logger.info('WORK', '恢复的 Agent 会话应从 /remote/work 读取并自动继续')
+    // 自动续跑：等 harness 重新挂载 agent 后，向主 agent 注入续跑指令（真正唤醒 Agent 会话）
+    const resumeDelayMs = Number(process.env.DSH_REMOTE_RESUME_DELAY_MS ?? 20_000)
+    const resumeTimer = setTimeout(() => {
+      const work = loadWorkState(WORK_FILE)
+      if (work === null || work.pending.length === 0) return
+      if (process.env.DSH_REMOTE_RESUME === '0') {
+        logger.info('WORK', '自动续跑被 DSH_REMOTE_RESUME=0 禁用')
+        return
+      }
+      const live = ctx.agents.list()
+      const agent = live.find((a) => !isSubagent(a)) ?? live[0]
+      if (agent === undefined) {
+        logger.info('WORK', '自动续跑：暂无 live agent，跳过（等待用户交互）')
+        return
+      }
+      const text = [
+        '【服务端自动续跑】bridge 重启完成，检测到进行中的事项，请自动继续执行，无需用户再提示：',
+        `活动：${work.activity ?? '-'}`,
+        '待办清单：',
+        ...work.pending.map((p, i) => `${i + 1}. ${p}`),
+        '（最新状态见 ~/.dsh/remote-control-work.json，完成后请把该文件清空。）',
+      ].join('\n')
+      logger.info('WORK', `自动续跑：向 agent ${String(agent.id).slice(0, 12)} 注入续跑指令（待办 ${work.pending.length} 条）`)
+      agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }))
+    }, resumeDelayMs)
+    resumeTimer.unref?.()
   } else {
     logger.info('WORK', '无待办事项')
   }
