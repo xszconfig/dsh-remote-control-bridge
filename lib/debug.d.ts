@@ -58,5 +58,7 @@ export declare class DebugManager {
     start(sessionId: string, opts: DebugStartOptions): DebugStateSnapshot;
     command(sessionId: string, action: 'resume' | 'step' | 'step_out'): void;
     variables(sessionId: string, variablesReference: string): void;
+    /** 读取变量并返回（Agent 调试工具用；不广播）。 */
+    variablesFor(sessionId: string, variablesReference: string): Promise<DebugVariableWire[]>;
     stop(sessionId: string): Promise<void>;
 }

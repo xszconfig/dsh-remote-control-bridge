@@ -352,8 +352,16 @@ class InspectorSession {
     await this.send(method, {})
   }
 
+  /** 读取变量并广播到手机（手机按钮走这条）。 */
   async variables(variablesReference: string): Promise<void> {
     if (this.ws === null || this.stopped) return
+    const vars = await this.variablesFor(variablesReference)
+    this.hooks.onVariables(this.sessionId, variablesReference, vars)
+  }
+
+  /** 读取变量并返回列表（Agent 调试工具走这条；不触发广播）。 */
+  async variablesFor(variablesReference: string): Promise<DebugVariableWire[]> {
+    if (this.ws === null || this.stopped) return []
     try {
       const r = await this.send('Runtime.getProperties', {
         objectId: variablesReference,
@@ -364,7 +372,7 @@ class InspectorSession {
         name: string
         value?: { type?: string; value?: unknown; description?: string; objectId?: string; className?: string }
       }> | undefined) ?? []
-      const vars: DebugVariableWire[] = result
+      return result
         .filter((p) => p.value !== undefined)
         .map((p) => {
           const v = p.value as { type?: string; value?: unknown; description?: string; objectId?: string; className?: string }
@@ -379,9 +387,8 @@ class InspectorSession {
             variablesReference: hasChildren ? (v.objectId as string) : '',
           }
         })
-      this.hooks.onVariables(this.sessionId, variablesReference, vars)
-    } catch (e: unknown) {
-      this.hooks.onVariables(this.sessionId, variablesReference, [])
+    } catch {
+      return []
     }
   }
 
@@ -450,6 +457,13 @@ export class DebugManager {
     const s = this.sessions.get(sessionId)
     if (s === undefined) throw new Error('该会话没有调试进程')
     void s.variables(variablesReference)
+  }
+
+  /** 读取变量并返回（Agent 调试工具用；不广播）。 */
+  async variablesFor(sessionId: string, variablesReference: string): Promise<DebugVariableWire[]> {
+    const s = this.sessions.get(sessionId)
+    if (s === undefined) throw new Error('该会话没有调试进程')
+    return s.variablesFor(variablesReference)
   }
 
   async stop(sessionId: string): Promise<void> {
