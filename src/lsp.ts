@@ -50,6 +50,8 @@ interface ServerState {
   pending: Map<number, (result: unknown) => void>
   nextId: number
   openDocs: Map<string, string>
+  /** uri → 触发会话（诊断广播做会话隔离用）。 */
+  docSessions: Map<string, string>
   dead: boolean
   restartBlockedUntil: number
   /** initialize 完成即 resolve（didOpen/didChange 必须等它，否则 server 静默丢弃）。 */
@@ -57,8 +59,8 @@ interface ServerState {
 }
 
 export interface LspOptions {
-  /** 诊断回调：path + 该文件当前全部诊断。 */
-  onDiagnostics: (path: string, diagnostics: LspDiagnosticWire[]) => void
+  /** 诊断回调：path + 触发它的会话 + 该文件当前全部诊断。 */
+  onDiagnostics: (path: string, sessionId: string | undefined, diagnostics: LspDiagnosticWire[]) => void
   /** 语言 → 覆盖命令（测试注入 mock server 用）。 */
   cmdOverride?: Record<string, string[]>
   /** 日志钩子（默认静默）。 */
@@ -82,8 +84,8 @@ export class LspManager {
     })
   }
 
-  /** Agent 编辑/写入了文件 → 打开或更新到对应 language server。 */
-  notifyFileChanged(path: string): void {
+  /** Agent 编辑/写入了文件 → 打开或更新到对应 language server（sessionId 用于诊断会话隔离）。 */
+  notifyFileChanged(path: string, sessionId?: string): void {
     if (!path.startsWith('/')) return // 只处理绝对路径
     if (!existsSync(path)) return
     const lang = this.langFor(path)
@@ -98,9 +100,12 @@ export class LspManager {
       const doc = state.openDocs.get(uri)
       if (doc === undefined) {
         state.openDocs.set(uri, '')
+        state.docSessions.set(uri, sessionId ?? '')
         this.notify(state, 'textDocument/didOpen', {
           textDocument: { uri, languageId: LANGS[lang].languageId, version: 1, text: '' },
         })
+      } else {
+        state.docSessions.set(uri, sessionId ?? '')
       }
       // 全量同步：读盘节流后发出（首次 didOpen 后立即同步一次内容）
       const prev = this.diagTimers.get(path)
@@ -198,6 +203,7 @@ export class LspManager {
         pending: new Map(),
         nextId: 1,
         openDocs: new Map(),
+        docSessions: new Map(),
         dead: false,
         restartBlockedUntil: 0,
         initPromise: Promise.resolve(),
@@ -316,7 +322,7 @@ export class LspManager {
         })
         .filter((d): d is LspDiagnosticWire => d !== null)
         .slice(0, 200)
-      this.opts.onDiagnostics(path, diags)
+      this.opts.onDiagnostics(path, state.docSessions.get(p.uri), diags)
       return
     }
     if (msg.id !== undefined && typeof msg.id === 'number') {

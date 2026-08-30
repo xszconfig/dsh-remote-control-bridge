@@ -383,8 +383,9 @@ export function apply(ctx: Context) {
 
   // ---- LSP 代码智能：Agent 编辑文件 → Language Server 诊断 → 广播到手机 ----
   const lsp = new LspManager({
-    onDiagnostics: (path, diagnostics) => {
-      broadcast({ type: 'diagnostics', path, diagnostics })
+    onDiagnostics: (path, sessionId, diagnostics) => {
+      // 诊断带 sessionId：手机端只在对应会话内展示，杜绝跨会话串扰
+      broadcast({ type: 'diagnostics', sessionId: sessionId ?? '', path, diagnostics })
     },
     log: (m) => logger.debug('LSP', m),
   })
@@ -432,17 +433,22 @@ export function apply(ctx: Context) {
   ]
 
   // ---- Deep Diving：模型请求起止 → 手机指示条 ----
+  // modelStreams：会话 → 进行中的模型请求开始时间。订阅时下发，
+  // 让"切进正在思考的会话"也能立刻看到指示条（状态随会话，不串扰）。
+  const modelStreams = new Map<string, number>()
   ctx.on('llm/stream', (options, next) => {
     const sessionId = options.sessionId
     if (sessionId === undefined) return next()
     const startedAt = Date.now()
     const sid = String(sessionId)
+    modelStreams.set(sid, startedAt)
     broadcast({ type: 'model_waiting', sessionId: sid, startedAt })
     const stream = next()
     return (async function* () {
       try {
         for await (const chunk of stream) yield chunk
       } finally {
+        if (modelStreams.get(sid) === startedAt) modelStreams.delete(sid)
         broadcast({ type: 'model_waiting_done', sessionId: sid, startedAt, elapsedMs: Date.now() - startedAt })
       }
     })()
@@ -521,7 +527,7 @@ export function apply(ctx: Context) {
     }
     // LSP：实时事件里 Agent 编辑/写入文件 → 触发语言诊断（历史投影不触发，避免重放风暴）
     if (event.type === 'tool/call') {
-      for (const p of toolFilePaths(event.data)) lsp.notifyFileChanged(p)
+      for (const p of toolFilePaths(event.data)) lsp.notifyFileChanged(p, String(session.id))
     }
   })
 
@@ -943,6 +949,8 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
             events,
             hasMore,
             total: all.length,
+            // 该会话正在等模型 → 切进来立刻显示 Deep Diving（会话级状态，不串扰）
+            modelWaitingSince: modelStreams.get(String(liveSession.id)) ?? null,
             ...(scope?.session === liveSession ? { queue: queueItemsOf(scope) } : {}),
           })
           break

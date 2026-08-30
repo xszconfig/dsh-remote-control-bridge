@@ -282,6 +282,8 @@ export interface EvHistory {
   hasMore?: boolean
   /** 会话事件总数（展示用）。 */
   total?: number
+  /** 该会话正在进行的模型请求开始时间（null = 未在等待）；切会话后指示条不串扰。 */
+  modelWaitingSince?: number | null
 }
 /** 排队消息投影：placement = queued(下一轮)/steering(用户插队中)/context(系统注入)。 */
 export interface QueueItemWire {
@@ -318,9 +320,10 @@ export interface EvThinkDelta {
   sessionId: string
   text: string
 }
-/** LSP 诊断推送：某文件的最新诊断集合（空数组 = 该文件已无问题）。 */
+/** LSP 诊断推送：某文件的最新诊断集合（空数组 = 该文件已无问题）。带 sessionId 做会话隔离。 */
 export interface EvDiagnostics {
   type: 'diagnostics'
+  sessionId: string
   path: string
   diagnostics: LspDiagnosticWire[]
 }
@@ -435,4 +438,4 @@ export interface DeviceRecord {
   lastSeenAt: number
 }
 
-export const BRIDGE_VERSION = '0.11.4'
+export const BRIDGE_VERSION = '0.11.5'
