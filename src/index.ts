@@ -256,14 +256,15 @@ export function apply(ctx: Context) {
     try {
       const session = ctx.sessions.list().find((s) => String(s.id) === sessionId)
       if (session === undefined) return null
-      const goals = (ctx as unknown as { goals?: { get(agent: unknown): GoalViewLike | undefined } }).goals
+      // ctx.get 是软读（无需 inject 声明）；属性直读会触发 cordis 的 inject 陷阱抛错
+      const goals = ctx.get('goals') as { get(agent: unknown): GoalViewLike | undefined } | undefined
       const agent = ctx.agents.get(session.id)
       const view = agent !== undefined ? goals?.get(agent) : undefined
       if (view !== undefined) return goalWireFromView(view)
-      const proj = (ctx as unknown as {
-        sessionProjections?: { snapshot(s: unknown): { values: Record<string, unknown> } }
-      }).sessionProjections?.snapshot(session)
-      return goalWireFromProjection(proj?.values?.['goal'] as GoalProjectionLike | null | undefined)
+      const proj = ctx.get('sessionProjections') as
+        | { snapshot(s: unknown): { values: Record<string, unknown> } }
+        | undefined
+      return goalWireFromProjection(proj?.snapshot(session).values?.['goal'] as GoalProjectionLike | null | undefined)
     } catch (e: unknown) {
       logger.warn('GOAL', `读取会话 ${sessionId.slice(0, 12)} 目标失败（降级隐藏）: ${String(e)}`)
       return null
@@ -273,10 +274,10 @@ export function apply(ctx: Context) {
   /** 活会话的任务列表（todos 投影，todo/write 事件全量快照；turn/start 后清空）。 */
   const todosOfSession = (session: Session): TodoWire[] => {
     try {
-      const proj = (ctx as unknown as {
-        sessionProjections?: { snapshot(s: unknown): { values: Record<string, unknown> } }
-      }).sessionProjections?.snapshot(session)
-      const todos = proj?.values?.['todos'] as Array<{ content: string; status: string }> | null | undefined
+      const proj = ctx.get('sessionProjections') as
+        | { snapshot(s: unknown): { values: Record<string, unknown> } }
+        | undefined
+      const todos = proj?.snapshot(session).values?.['todos'] as Array<{ content: string; status: string }> | null | undefined
       if (!Array.isArray(todos)) return []
       return todos
         .filter((t) => t !== null && typeof t === 'object' && typeof t.content === 'string')
@@ -1176,6 +1177,7 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
         break
       }
       case 'debug_command': {
+        logger.info('DEBUG', `调试指令 ${cmd.action}${cmd.variablesReference !== undefined ? ` ref=${cmd.variablesReference.slice(0, 8)}` : ''} session=${cmd.sessionId.slice(0, 12)}`)
         try {
           if (cmd.action === 'variables') {
             if (cmd.variablesReference === undefined || cmd.variablesReference === '') {
