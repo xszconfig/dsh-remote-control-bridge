@@ -41,6 +41,10 @@ const inboxRemoved = []
 const followupCalls = []
 const inboxSteered = []
 const commandExecuteCalls = []
+const resumeCalls = []          // ctx.agents.resume 调用记录（休眠会话自动打开）
+const resumedFollowupCalls = [] // 顶层休眠会话恢复后 followup 投递的消息
+const subagentFollowupCalls = [] // ctx.subagents.followup 调用记录（子代理冷恢复）
+const presetMountCalls = []     // agentPresets.mount 调用记录（resume setup 挂 preset）
 const eventsListeners = new Map()
 const inboxMessages = [
   { id: 'm1', source: { kind: 'user' }, content: [{ type: 'text', text: '排队的消息1' }] },
@@ -101,6 +105,32 @@ const mockCtx = {
     get: (id) => (String(id) === 'session-1'
       ? { id: 'session-1', status: 'running', session: mockSession, inbox, steer: (m) => { inboxSteered.push(m) }, followup: (m) => { followupCalls.push(m) } }
       : undefined),
+    // 休眠会话自动打开：DSH Web 同款 ctx.agents.resume。cold-1 恢复成功，其余抛错模拟失败。
+    resume: async (options) => {
+      resumeCalls.push(options)
+      const sid = String(options.resumeSessionId)
+      if (sid === 'cold-1') {
+        const resumed = {
+          id: sid,
+          status: 'idle',
+          session: {
+            id: sid,
+            header: { cwd: '/proj-a', agentPreset: 'smoke-preset' },
+            events: [],
+            requestHeader: () => undefined,
+          },
+          inbox: { nextTurn: [], nextStep: [] },
+          followup: (m) => { resumedFollowupCalls.push(m) },
+        }
+        if (options.setup) {
+          // setup 会装模型选择 + 挂 preset（installModelSelection 是真实实现，走 ctx.on 注册）
+          const agentCtx = { agent: resumed, on: () => () => {} }
+          await options.setup(agentCtx)
+        }
+        return { agent: resumed }
+      }
+      throw new Error('resume failed: session not found')
+    },
   },
   workspaceRegistry: {
     list: () => [{ id: 'ws-1', title: '项目A', path: '/a', sessionIds: ['session-1', 'cold-1'] }],
@@ -181,6 +211,23 @@ const mockCtx = {
             }
           }
           return { values: {} }
+        },
+      }
+    }
+    if (name === 'agentDefaultModel') {
+      return { currentSelection: () => ({ provider: 'deepseek', model: 'deepseek-chat' }) }
+    }
+    if (name === 'agentPresets') {
+      return {
+        mount: async (agentCtx, presetId) => { presetMountCalls.push({ presetId }) },
+      }
+    }
+    if (name === 'subagents') {
+      // 子代理续跑：cold-3 是其父 cold-1 的子代理（header.parentSession='cold-1'）
+      return {
+        followup: async (parent, childId, content, options) => {
+          subagentFollowupCalls.push({ parentId: String(parent.id), childId: String(childId), content, options })
+          return 'msg-sub-1'
         },
       }
     }
@@ -362,11 +409,47 @@ check('未分组会话 workspaceId=null', hello?.sessions?.find((s) => s.id === 
   check('冷会话订阅带 goal（投影冷读）', hist.goal?.objective === '冷会话目标：重构完成' && hist.goal?.phase === 'blocked' && hist.goal?.blockedMessage === '等待用户确认' && hist.goal?.roundsStarted === 2, JSON.stringify(hist.goal))
 }
 
-// ---- 冷会话发消息：友好报错 ----
+// ---- 顶层休眠会话发消息：自动打开（agents.resume）→ 消息送达 followup ----
 {
+  phone.msgs.length = 0
+  const beforeFollowup = resumedFollowupCalls.length
+  const beforeResume = resumeCalls.length
   phone.ws.send(JSON.stringify({ type: 'send_message', sessionId: 'cold-1', text: 'hi' }))
-  const err = await awaitMsg(phone.msgs, (m) => m.type === 'error' && m.code === 'not_running', '冷会话发送报错')
-  check('冷会话发送友好报错', err?.message?.includes('桌面端打开') === true, err?.message)
+  await new Promise((r) => setTimeout(r, 400))
+  check('顶层休眠会话 send_message 触发 agents.resume',
+    resumeCalls.length === beforeResume + 1 && String(resumeCalls[resumeCalls.length - 1].resumeSessionId) === 'cold-1',
+    JSON.stringify(resumeCalls.map((c) => String(c.resumeSessionId))))
+  check('resume setup 挂 preset（模型选择 + agentPresets.mount）',
+    presetMountCalls.length >= 1 && presetMountCalls[presetMountCalls.length - 1].presetId === 'smoke-preset',
+    JSON.stringify(presetMountCalls))
+  check('消息送达恢复后的 agent.followup',
+    resumedFollowupCalls.length === beforeFollowup + 1 && resumedFollowupCalls[resumedFollowupCalls.length - 1].content?.[0]?.text === 'hi',
+    JSON.stringify(resumedFollowupCalls.map((f) => f.content?.[0]?.text)))
+  check('打开成功后不再回 not_running 报错', phone.msgs.every((m) => m.type !== 'error'), JSON.stringify(phone.msgs.filter((m) => m.type === 'error')))
+}
+
+// ---- 子代理休眠会话发消息：先拉起父会话，再经 subagents.followup 冷恢复投递 ----
+{
+  phone.msgs.length = 0
+  const beforeResume = resumeCalls.length
+  phone.ws.send(JSON.stringify({ type: 'send_message', sessionId: 'cold-3', text: '继续子代理' }))
+  await new Promise((r) => setTimeout(r, 400))
+  check('子代理会话 send_message 走 subagents.followup',
+    subagentFollowupCalls.length === 1 && subagentFollowupCalls[0].childId === 'cold-3'
+    && subagentFollowupCalls[0].parentId === 'cold-1'
+    && subagentFollowupCalls[0].content?.[0]?.text === '继续子代理',
+    JSON.stringify(subagentFollowupCalls))
+  check('子代理投递前先拉起父会话（父会话是顶层，走 agents.resume）',
+    resumeCalls.length === beforeResume + 1 && String(resumeCalls[resumeCalls.length - 1].resumeSessionId) === 'cold-1',
+    JSON.stringify(resumeCalls.map((c) => String(c.resumeSessionId))))
+}
+
+// ---- 打开失败仍给友好报错 ----
+{
+  phone.msgs.length = 0
+  phone.ws.send(JSON.stringify({ type: 'send_message', sessionId: 'cold-404', text: 'hi' }))
+  const err = await awaitMsg(phone.msgs, (m) => m.type === 'error' && m.code === 'not_running', '打开失败报错')
+  check('打开失败仍回 not_running 且附原因', err?.message?.includes('自动打开失败') === true, err?.message)
 }
 
 // ---- 斜杠命令路由：已注册命令走 commands.execute（与 Web composer 同链），普通文本发模型 ----
