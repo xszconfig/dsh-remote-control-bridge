@@ -116,6 +116,25 @@ const coldSessions = {
   },
 }
 
+// agent 状态可变：模拟真实 harness 的 idle→running 唤醒（followup 同步触发 agent/status running，构成重入）。
+// 修复前 tryResumeIfPending 在指纹写盘前被 followup 的重入再次调用 → 同批待办连发两条续跑指令。
+let agentStatus = 'running'
+const mockAgent = () => ({
+  id: 'session-1',
+  status: agentStatus,
+  session: mockSession,
+  inbox,
+  steer: (m) => { inboxSteered.push(m) },
+  followup: (m) => {
+    followupCalls.push(m)
+    if (agentStatus === 'idle') {
+      agentStatus = 'running'
+      const l = listeners.get('agent/status')
+      if (l) l({ agent: mockAgent(), status: 'running' })
+    }
+  },
+})
+
 const mockCtx = {
   webServer: {
     port: 0, // 稍后由测试服务器实际端口覆盖
@@ -125,10 +144,8 @@ const mockCtx = {
   },
   sessions: { list: () => [mockSession, mockSubSession] },
   agents: {
-    list: () => [{ id: 'session-1', status: 'running', session: mockSession, inbox, steer: (m) => { inboxSteered.push(m) }, followup: (m) => { followupCalls.push(m) } }],
-    get: (id) => (String(id) === 'session-1'
-      ? { id: 'session-1', status: 'running', session: mockSession, inbox, steer: (m) => { inboxSteered.push(m) }, followup: (m) => { followupCalls.push(m) } }
-      : undefined),
+    list: () => [mockAgent()],
+    get: (id) => (String(id) === 'session-1' ? mockAgent() : undefined),
     // 休眠会话自动打开：DSH Web 同款 ctx.agents.resume。cold-1 恢复成功，其余抛错模拟失败。
     resume: async (options) => {
       resumeCalls.push(options)
@@ -315,6 +332,13 @@ mockCtx.webServer.port = port
 apply(mockCtx)
 check('exports', name === 'dsh-remote-control-bridge' && Array.isArray(inject) && inject.includes('webServer') && inject.includes('sessionPersistence'))
 
+// boot 立即注入：agent 已在 boot 时挂载（本例 mock 里 list() 直接返回 running agent），
+// 续跑指令应同步注入，而不是等 20s 兜底定时器（这是「重启后要等好久才续上」的延迟来源之一）。
+{
+  const bootResume = followupCalls.find((f) => f.content?.[0]?.text?.includes('自动续跑'))?.content?.[0]?.text ?? ''
+  check('boot 立即注入续跑指令（同步、不等定时器）', bootResume.includes('冒烟待办A') && bootResume.includes('冒烟待办B'), JSON.stringify({ n: followupCalls.length, txt: bootResume.slice(0, 80) }))
+}
+
 // 等待 bridge 的 mux 客户端连上伪 mux
 let muxReady = false
 for (let i = 0; i < 50 && !muxReady; i++) {
@@ -426,6 +450,46 @@ const hello = phone.msgs.find((m) => m.type === 'hello')
   check('排队消息跨重启恢复：丢失消息重新注入', restored !== undefined, JSON.stringify(followupCalls.map((f) => f.content?.[0]?.text?.slice(0, 30))))
   const workAfter = JSON.parse((await import('node:fs')).readFileSync((process.env.DSH_HOME ?? (process.env.HOME + '/.dsh')) + '/remote-control-work.json', 'utf8'))
   check('恢复后清理该会话快照', workAfter.queues === undefined || workAfter.queues['session-1'] === undefined, JSON.stringify(workAfter.queues))
+}
+
+// ---- 自动续跑幂等：同批待办只注入一次（重入触发源 + 跨触发源 + agent 挂载即时注入）----
+{
+  const fs = await import('node:fs')
+  const workFile = (process.env.DSH_HOME ?? (process.env.HOME + '/.dsh')) + '/remote-control-work.json'
+  const resumeCount = (from) => followupCalls.slice(from).filter((f) => f.content?.[0]?.text?.includes('自动续跑')).length
+  const statusListener = listeners.get('agent/status')
+  const createdListener = listeners.get('agent/created')
+
+  // 1) 重入触发源：followup 唤醒 idle agent → 同步触发 agent/status running → 重入 tryResumeIfPending。
+  //    修复前指纹写盘晚于 followup，重入会再次注入 → 同批连发两条；修复后进程内锁阻断重入 → 恰好一次。
+  fs.writeFileSync(workFile, JSON.stringify({ activity: '重入自测', pending: ['重入待办1'], notes: [], updatedAt: Date.now() }))
+  agentStatus = 'idle'
+  const beforeReentrant = followupCalls.length
+  if (statusListener) statusListener({ agent: mockAgent(), status: 'running' })
+  check('重入触发源下同批待办只注入一次续跑指令', resumeCount(beforeReentrant) === 1, JSON.stringify({ n: resumeCount(beforeReentrant) }))
+
+  // 2) 跨触发源幂等：同一批待办再次触发（agent/status + agent/created）不得重复注入（磁盘指纹幂等）
+  const beforeRepeat = followupCalls.length
+  if (statusListener) statusListener({ agent: mockAgent(), status: 'running' })
+  if (createdListener) createdListener({ agent: mockAgent() })
+  check('跨触发源同批待办不重复注入（磁盘指纹幂等）', resumeCount(beforeRepeat) === 0, JSON.stringify({ n: resumeCount(beforeRepeat) }))
+  agentStatus = 'running'
+
+  // 3) agent 挂载（agent/created）即时注入：新挂载的 agent 不必等 20s 兜底定时器
+  fs.writeFileSync(workFile, JSON.stringify({ activity: '挂载自测', pending: ['挂载待办1'], notes: [], updatedAt: Date.now() }))
+  const beforeCreated = followupCalls.length
+  if (createdListener) createdListener({ agent: mockAgent() })
+  check('agent 挂载（agent/created）即时注入续跑指令', resumeCount(beforeCreated) === 1, JSON.stringify({ n: resumeCount(beforeCreated) }))
+
+  // 4) 队列恢复重入防护：恢复丢失消息的 followup 唤醒 idle agent → agent/status running →
+  //    重入 restoreQueueIfLost。修复前同一条丢失消息会被重复注入；修复后恰好一次。
+  fs.writeFileSync(workFile, JSON.stringify({ activity: null, pending: [], notes: [], queues: { 'session-1': { items: [{ id: 'gone-reentrant', placement: 'queued', text: '重入丢失的排队消息' }], at: Date.now() } }, updatedAt: Date.now() }))
+  agentStatus = 'idle'
+  const beforeQueue = followupCalls.length
+  if (statusListener) statusListener({ agent: mockAgent(), status: 'running' })
+  const queueRestored = followupCalls.slice(beforeQueue).filter((f) => f.content?.[0]?.text?.includes('重入丢失的排队消息'))
+  check('队列恢复重入防护：同一条丢失消息只注入一次', queueRestored.length === 1, JSON.stringify({ n: queueRestored.length }))
+  agentStatus = 'running'
 }
 
 check('hello 0.11.10 含三挂起队列', hello?.version === '0.11.10' && Array.isArray(hello?.pendingApprovals) && Array.isArray(hello?.pendingRemoteApprovals) && Array.isArray(hello?.pendingQuestions), hello?.version)
