@@ -68,6 +68,13 @@ const mockSession = {
   ],
 }
 
+// 活子代理会话：header 带 parentSession，subagent 投影提供创建时的 description
+const mockSubSession = {
+  id: 'session-sub',
+  header: { parentSession: 'session-1', delegationDepth: 1, origin: 'subagent', cwd: '/mock', createdAt: 600 },
+  events: [],
+}
+
 // 冷会话（已持久化、未加载）：list/readFrom 模拟持久化层
 const coldSessions = {
   'cold-1': {
@@ -86,6 +93,23 @@ const coldSessions = {
     meta: { id: 'cold-3', createdAt: 1500, cwd: '/proj-a', parentSession: 'cold-1' },
     events: [],
   },
+  // 创建子代理的父会话：tool/call 带 description（主 agent 派发子代理时写的凝练描述）
+  'cold-parent': {
+    meta: { id: 'cold-parent', createdAt: 500, cwd: '/proj-a' },
+    events: [
+      { seq: 1, time: 500, type: 'tool/call', data: { callId: 'sub-call-1', name: 'subagent', arguments: JSON.stringify({ description: '自动续跑根因排查修复', prompt: '排查自动续跑失败的根因并修复', run_in_background: true }) } },
+    ],
+  },
+  // 子代理会话：投影缓存里带 subagent.label（= tool/call 的 description）+ 长首个 Prompt
+  'cold-sub': {
+    meta: { id: 'cold-sub', createdAt: 400, cwd: '/proj-a', parentSession: 'cold-parent' },
+    events: [],
+  },
+  // 子代理会话：无 description，回退原投影标题
+  'cold-sub-nodesc': {
+    meta: { id: 'cold-sub-nodesc', createdAt: 300, cwd: '/proj-a', parentSession: 'cold-parent' },
+    events: [],
+  },
 }
 
 const mockCtx = {
@@ -95,7 +119,7 @@ const mockCtx = {
     register(r) { routes.set(`${r.kind}:${r.path}`, r.handler) },
     registerUpgrade(r) { upgrades.set(r.path, r.handler) },
   },
-  sessions: { list: () => [mockSession] },
+  sessions: { list: () => [mockSession, mockSubSession] },
   agents: {
     list: () => [{ id: 'session-1', status: 'running', session: mockSession, inbox, steer: (m) => { inboxSteered.push(m) }, followup: (m) => { followupCalls.push(m) } }],
     get: (id) => (String(id) === 'session-1'
@@ -107,9 +131,15 @@ const mockCtx = {
     archivedSessionIds: [],
   },
   sessionTitle: { get: () => undefined },
-  // todos 投影 mock（任务列表会话隔离用）
+  // todos 投影 mock（任务列表会话隔离用）+ subagent 投影 mock（子代理标题 description）
   sessionProjections: {
-    snapshot: () => ({ values: { todos: [{ content: '写协议字段', status: 'in_progress' }, { content: '跑冒烟', status: 'pending' }] } }),
+    snapshot: (session) => {
+      const values = { todos: [{ content: '写协议字段', status: 'in_progress' }, { content: '跑冒烟', status: 'pending' }] }
+      if (session && String(session.id) === 'session-sub') {
+        values.subagent = { mode: 'one-shot', label: 'Deep Diving 计时闪烁修复', seq: 0 }
+      }
+      return { values }
+    },
     onChanged: () => () => {},
   },
   // dsh-goal 软依赖 mock：活会话读 GoalView
@@ -165,6 +195,12 @@ const mockCtx = {
         cachedSnapshot(meta) {
           if (String(meta.id) === 'cold-1') {
             return { values: { title: '冷会话标题A', sessionListMetadata: { blank: false, lastPromptAt: 2000 } } }
+          }
+          if (String(meta.id) === 'cold-sub') {
+            return { values: { title: '排查自动续跑失败的根因并修复（很长的首个 Prompt 无法在一行内展示核心信息）', subagent: { mode: 'one-shot', label: '自动续跑根因排查修复', seq: 0 } } }
+          }
+          if (String(meta.id) === 'cold-sub-nodesc') {
+            return { values: { title: '回退原标题测试' } }
           }
           return undefined
         },
@@ -353,6 +389,21 @@ check('冷会话标题来自投影缓存 + 工作区归属', hello?.sessions?.fi
 check('会话按 updatedAt 倒序', hello?.sessions?.[0]?.id === 'cold-2', `${hello?.sessions?.[0]?.id}`)
 check('子代理会话带 parentSessionId', hello?.sessions?.find((s) => s.id === 'cold-3')?.parentSessionId === 'cold-1', JSON.stringify(hello?.sessions?.find((s) => s.id === 'cold-3')))
 check('未分组会话 workspaceId=null', hello?.sessions?.find((s) => s.id === 'cold-2')?.workspaceId === null && hello?.sessions?.find((s) => s.id === 'cold-2')?.name === 'proj-b')
+// ---- 子代理会话标题：description 覆盖首个 Prompt（活会话 + 冷会话 + 无 description 回退）----
+check('子代理会话标题 = 创建时 description（活会话，覆盖首个 Prompt）', hello?.sessions?.find((s) => s.id === 'session-sub')?.name === 'Deep Diving 计时闪烁修复', JSON.stringify(hello?.sessions?.find((s) => s.id === 'session-sub')))
+check('子代理会话标题 = 父会话 tool/call 的 description（冷会话）', hello?.sessions?.find((s) => s.id === 'cold-sub')?.name === '自动续跑根因排查修复', JSON.stringify(hello?.sessions?.find((s) => s.id === 'cold-sub')))
+check('无 description 的子代理会话回退原投影标题', hello?.sessions?.find((s) => s.id === 'cold-sub-nodesc')?.name === '回退原标题测试', JSON.stringify(hello?.sessions?.find((s) => s.id === 'cold-sub-nodesc')))
+
+// ---- 子代理会话标题：session/title 推送也用 description（覆盖 DSH 首个 Prompt）----
+{
+  const evListenerSub = listeners.get('session/event')
+  if (evListenerSub) {
+    phone.msgs.length = 0
+    evListenerSub(mockSubSession, { seq: 1, time: Date.now(), type: 'session/title', data: { title: '很长的首个 Prompt（不应作为标题）', messageSeqs: [1], source: { kind: 'fallback' } } })
+    const st = await awaitMsg(phone.msgs, (m) => m.type === 'session_title' && m.sessionId === 'session-sub', '子代理 session_title 推送')
+    check('session_title 推送子代理标题 = description', st.title === 'Deep Diving 计时闪烁修复', JSON.stringify(st))
+  }
+}
 
 // ---- 冷会话订阅：从持久化层读历史 ----
 {
