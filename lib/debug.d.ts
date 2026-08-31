@@ -61,4 +61,6 @@ export declare class DebugManager {
     /** 读取变量并返回（Agent 调试工具用；不广播）。 */
     variablesFor(sessionId: string, variablesReference: string): Promise<DebugVariableWire[]>;
     stop(sessionId: string): Promise<void>;
+    /** 插件卸载：同步终止所有活跃调试会话（kill Inspector 子进程、清定时器与 pending）。 */
+    dispose(): void;
 }

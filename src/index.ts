@@ -991,7 +991,8 @@ export function apply(ctx: Context) {
   // 不必等 20s 兜底定时器——这是「重启后代理挂载要等好久才续上」的主要延迟来源之一。
   resumeTick()
   // 兜底重试：首轮 resumeDelayMs 后、此后每 20s 一次；事件触发已覆盖绝大多数场景。
-  setTimeout(() => resumeTick(), resumeDelayMs).unref?.()
+  const resumeBootTimer = setTimeout(() => resumeTick(), resumeDelayMs)
+  resumeBootTimer.unref?.()
   const resumeInterval = setInterval(() => resumeTick(), 20_000)
   resumeInterval.unref?.()
 
@@ -2268,24 +2269,29 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
     },
   }
 
-  ctx.webServer.registerUpgrade(upgrade)
-  ctx.webServer.register(ping)
-  ctx.webServer.register(health)
-  ctx.webServer.register(workRoute)
-  ctx.webServer.register(sessionsRoute)
-  ctx.webServer.register(pairInfo)
-  ctx.webServer.register(pairPage)
-  ctx.webServer.register(devicesRoute)
-  ctx.webServer.register(connectedRoute)
-  ctx.webServer.register(approvalTestRoute)
-  ctx.webServer.register(logsRoute)
-  ctx.webServer.register(phoneLogsRoute)
-  ctx.webServer.register(debugStartRoute)
-  ctx.webServer.register(debugStopRoute)
+  // 收集全部路由/升级路由的 disposer：host-webserver 对重复 (kind, path) 直接 throw，
+  // 卸载时必须移除路由，否则残留路由指向旧闭包 → 二次 apply（热重载）必崩。
+  const routeDisposers: Array<() => void> = []
+  routeDisposers.push(ctx.webServer.registerUpgrade(upgrade))
+  routeDisposers.push(ctx.webServer.register(ping))
+  routeDisposers.push(ctx.webServer.register(health))
+  routeDisposers.push(ctx.webServer.register(workRoute))
+  routeDisposers.push(ctx.webServer.register(sessionsRoute))
+  routeDisposers.push(ctx.webServer.register(pairInfo))
+  routeDisposers.push(ctx.webServer.register(pairPage))
+  routeDisposers.push(ctx.webServer.register(devicesRoute))
+  routeDisposers.push(ctx.webServer.register(connectedRoute))
+  routeDisposers.push(ctx.webServer.register(approvalTestRoute))
+  routeDisposers.push(ctx.webServer.register(logsRoute))
+  routeDisposers.push(ctx.webServer.register(phoneLogsRoute))
+  routeDisposers.push(ctx.webServer.register(debugStartRoute))
+  routeDisposers.push(ctx.webServer.register(debugStopRoute))
 
   void runMuxClient()
 
   ctx.effect(() => () => {
+    // 逆序释放全部路由（升级路由 + REST）：先断新请求入口，再清资源
+    for (let i = routeDisposers.length - 1; i >= 0; i -= 1) routeDisposers[i]()
     muxStopped = true
     muxWs?.close()
     for (const ws of clients) ws.close()
@@ -2294,7 +2300,13 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
     clearInterval(pairPrune)
     clearInterval(divingTicker)
     clearInterval(resumeInterval)
+    clearInterval(broadcastStatTimer)
+    clearTimeout(resumeBootTimer)
+    for (const st of thinkStreams.values()) if (st.timer !== undefined) clearTimeout(st.timer)
+    thinkStreams.clear()
     lspFeedback.dispose()
+    lsp.dispose()
+    debug.dispose()
     for (const t of queueSnapTimers.values()) clearTimeout(t)
     queueSnapTimers.clear()
     clearInterval(heartbeat)

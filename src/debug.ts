@@ -101,6 +101,8 @@ class InspectorSession {
   private outputRing: string[] = []
   private consoleLines = new Set<string>() // consoleAPICalled 与 stdout 双通道去重
   private failReason: string | null = null // 启动失败/协议错误的说明（正常退出为 null）
+  private connectTimer: NodeJS.Timeout | null = null // 连接 Inspector 的 10s 兜底超时
+  private outputTimers = new Set<NodeJS.Timeout>() // stdout 侧 250ms 去重延迟（卸载时统一清理）
 
   constructor(
     private readonly hooks: DebugHooks,
@@ -165,13 +167,15 @@ class InspectorSession {
       const line = d.toString().trimEnd()
       // console.log 会同时走 stdout 和 Runtime.consoleAPICalled：两条通道到达顺序不定，
       // stdout 侧延迟 250ms 再发，若期间 consoleAPICalled 已发过同一行则丢弃（双行去重）
-      setTimeout(() => {
+      const t = setTimeout(() => {
+        this.outputTimers.delete(t)
         if (this.consoleLines.has(line)) {
           this.consoleLines.delete(line)
           return
         }
         this.emitOutput(line)
       }, 250)
+      this.outputTimers.add(t)
     })
     child.stderr?.on('data', (d: Buffer) => {
       const text = d.toString()
@@ -197,7 +201,8 @@ class InspectorSession {
       }
     })
     // 兜底：10 秒内没连上 Inspector 就报错停止（--inspect-brk=0 是随机端口，只能靠 stderr 行拿地址）
-    setTimeout(() => {
+    this.connectTimer = setTimeout(() => {
+      this.connectTimer = null
       if (this.ws === null && !this.stopped) this.failStart('连接调试器超时（未能从 stderr 发现 Inspector 地址）')
     }, 10_000)
   }
@@ -402,9 +407,26 @@ class InspectorSession {
     } catch {
       // 忽略：进程可能已退出
     }
+    this.dispose()
+  }
+
+  /** 同步释放底层资源：清定时器/pending、关 WS、杀子进程（stop 与插件卸载共用，幂等）。 */
+  dispose(): void {
+    this.stopped = true
+    this.breakpointsDone = true
+    if (this.connectTimer !== null) {
+      clearTimeout(this.connectTimer)
+      this.connectTimer = null
+    }
+    for (const t of this.outputTimers) clearTimeout(t)
+    this.outputTimers.clear()
+    // 丢弃在途 CDP 请求（不 reject：避免 void 化的 command/variables 调用方产生未处理拒绝；
+    // 挂起 await 的结局与既有「WS 关闭后 pending 永不落定」一致，仅释放引用不再泄漏）。
+    this.pending.clear()
     this.ws?.close()
     this.ws = null
     this.child?.kill()
+    this.child = null
   }
 }
 
@@ -484,5 +506,11 @@ export class DebugManager {
       this.sessions.delete(sessionId)
       this.hooks.onState(sessionId, { state: 'stopped', program: s.snapshot().program, cwd: s.snapshot().cwd, breakpoints: [] })
     }
+  }
+
+  /** 插件卸载：同步终止所有活跃调试会话（kill Inspector 子进程、清定时器与 pending）。 */
+  dispose(): void {
+    for (const s of this.sessions.values()) s.dispose()
+    this.sessions.clear()
   }
 }
