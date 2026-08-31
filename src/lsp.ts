@@ -110,6 +110,8 @@ interface ServerState {
   openDocs: Map<string, string>
   /** uri → 触发会话（诊断广播做会话隔离用）。 */
   docSessions: Map<string, string>
+  /** 最近一次编辑触发该 server 的会话（跨文件受影响文档回退归属用）。 */
+  lastSession: string | undefined
   dead: boolean
   restartBlockedUntil: number
   /** initialize 完成即 resolve（didOpen/didChange 必须等它，否则 server 静默丢弃）。 */
@@ -164,6 +166,8 @@ export class LspManager {
     if (this.missing.has(lang)) return
     const state = this.ensureServer(lang, path)
     if (state === undefined) return
+    // 记录触发会话：跨文件受影响文档（uri 不在 docSessions）的诊断归属回退到此会话
+    if (sessionId !== undefined && sessionId !== '') state.lastSession = sessionId
     const uri = pathToFileURL(path).href
     state.docPaths.set(uri, originalPath)
     // LSP 规定 didOpen 等通知必须在 initialize 完成之后：初始化未就绪先入队
@@ -433,6 +437,7 @@ export class LspManager {
         nextId: 1,
         openDocs: new Map(),
         docSessions: new Map(),
+        lastSession: undefined,
         dead: false,
         restartBlockedUntil: 0,
         initPromise: Promise.resolve(),
@@ -564,7 +569,7 @@ export class LspManager {
         .filter((d): d is LspDiagnosticWire => d !== null)
         .slice(0, 200)
       this.diagCache.set(p.uri, diags)
-      this.opts.onDiagnostics(path, state.docSessions.get(p.uri), diags)
+      this.opts.onDiagnostics(path, this.sessionOf(state, p.uri), diags)
       return
     }
     if (msg.method === 'intellij/ready-for-test') {
@@ -642,7 +647,21 @@ export class LspManager {
     })
     // 官方 Kotlin LSP 的诊断是 pull 模式（diagnosticProvider）：不会推送 publishDiagnostics，
     // 必须主动 textDocument/diagnostic 拉取。IntelliJ 分析是异步的，空结果时稍后重试。
-    if (state.pullDiagnostics) this.pullDiagnostics(state, uri)
+    // 除被编辑文件外，对该 server 已打开的其余文档也做一轮拉取（openDocs 规模有限，可控），
+    // 覆盖「改 A 文件导致 B 文件编译错误」的跨文件场景。
+    if (state.pullDiagnostics) this.pullAllDiagnostics(state)
+  }
+
+  /** pull 模式：同步后拉取该 server 全部已打开文档的诊断（跨文件覆盖）。 */
+  private pullAllDiagnostics(state: ServerState): void {
+    for (const uri of state.openDocs.keys()) this.pullDiagnostics(state, uri)
+  }
+
+  /** 诊断归属会话：优先该文档的 didOpen 会话，跨文件受影响文档回退到最近触发会话。 */
+  private sessionOf(state: ServerState, uri: string): string | undefined {
+    const s = state.docSessions.get(uri)
+    if (s !== undefined && s !== '') return s
+    return state.lastSession
   }
 
   /** 把一条 LSP Diagnostic（push 或 pull 两种来源共用）转成桥接的 wire 结构。 */
@@ -676,7 +695,7 @@ export class LspManager {
         this.diagCache.set(uri, diags)
         if (diags.length > 0) {
           this.opts.log?.(`[lsp] pull 诊断 ${diags.length} 条：${diags[0].message.slice(0, 80)}`)
-          this.opts.onDiagnostics(path, state.docSessions.get(uri), diags)
+          this.opts.onDiagnostics(path, this.sessionOf(state, uri), diags)
         } else {
           setTimeout(() => this.pullDiagnostics(state, uri, attempts - 1, delayMs), delayMs)
         }

@@ -39,6 +39,7 @@ const sessionAppendLog = []
 
 const inboxRemoved = []
 const followupCalls = []
+const injectCalls = []          // LSP 诊断反馈：运行中会话 agent.inject（next-step）记录
 const inboxSteered = []
 const commandExecuteCalls = []
 const resumeCalls = []          // ctx.agents.resume 调用记录（休眠会话自动打开）
@@ -125,6 +126,7 @@ const mockAgent = () => ({
   session: mockSession,
   inbox,
   steer: (m) => { inboxSteered.push(m) },
+  inject: (m) => { injectCalls.push(m) },
   followup: (m) => {
     followupCalls.push(m)
     if (agentStatus === 'idle') {
@@ -972,6 +974,192 @@ process.stdin.on('data', (c) => { buf = Buffer.concat([buf, c]); tryParse() })
   check('Kotlin .kt 走 kotlin-language-server 通道（mock）',
     lastKt?.path === `${TMP}/lsp-test-example.kt` && lastKt.diags.length === 2 && lastKt.sessionId === 'session-1',
     JSON.stringify(lastKt))
+  mgr.dispose()
+}
+
+// ---- LSP 诊断反馈闭环（LspFeedback 决策逻辑 + 逃生门 + 跨文件回退 + Kotlin pull 覆盖）----
+{
+  const { LspFeedback, lspFeedbackEnabledFromEnv } = await import(new URL('../lib/lsp-feedback.js', import.meta.url).href)
+
+  // 逃生门判定（默认开启；0/false 关闭；1/true 开启）
+  check('DSH_REMOTE_LSP_FEEDBACK 默认开启', lspFeedbackEnabledFromEnv({}) === true)
+  check('DSH_REMOTE_LSP_FEEDBACK=0 关闭', lspFeedbackEnabledFromEnv({ DSH_REMOTE_LSP_FEEDBACK: '0' }) === false)
+  check('DSH_REMOTE_LSP_FEEDBACK=false/FALSE 关闭', lspFeedbackEnabledFromEnv({ DSH_REMOTE_LSP_FEEDBACK: 'false' }) === false && lspFeedbackEnabledFromEnv({ DSH_REMOTE_LSP_FEEDBACK: 'FALSE' }) === false)
+  check('DSH_REMOTE_LSP_FEEDBACK=1/true 开启', lspFeedbackEnabledFromEnv({ DSH_REMOTE_LSP_FEEDBACK: '1' }) === true && lspFeedbackEnabledFromEnv({ DSH_REMOTE_LSP_FEEDBACK: 'true' }) === true)
+
+  const mkErr = (path, line, message) => ({ path, line, column: 1, severity: 1, message })
+  const mkWarn = (path, line) => ({ path, line, column: 1, severity: 2, message: '未使用的变量' })
+
+  // 1) 运行中会话：error 注入一次、含错误文本、warning 不注入；同批去重
+  {
+    const injected = []
+    const fb = new LspFeedback({ enabled: true, inject: (sid, text) => injected.push({ sid, text }), log: () => {} })
+    fb.handle('/a.ts', 'session-1', [mkErr('/a.ts', 3, '类型不匹配：number 不能赋给 string'), mkWarn('/a.ts', 7)])
+    fb.flush('session-1')
+    check('LSP 反馈：error 注入一次且含错误文本（运行中会话）',
+      injected.length === 1 && injected[0].sid === 'session-1' && injected[0].text.includes('类型不匹配'),
+      JSON.stringify(injected.map((i) => i.text.slice(0, 50))))
+    check('LSP 反馈：warning 不注入（不含未使用变量）', !injected[0].text.includes('未使用的变量'), injected[0].text)
+
+    fb.handle('/a.ts', 'session-1', [mkErr('/a.ts', 3, '类型不匹配：number 不能赋给 string')])
+    fb.flush('session-1')
+    check('LSP 反馈：同批去重（第二次同诊断不注入）', injected.length === 1, `n=${injected.length}`)
+    fb.dispose()
+  }
+
+  // 2) 进展语义 + 每轮注入上限 + 清零静默
+  {
+    const injected = []
+    const fb = new LspFeedback({ enabled: true, inject: (_sid, text) => injected.push(text), log: () => {} })
+    fb.handle('/a.ts', 'session-1', [mkErr('/a.ts', 1, 'e1'), mkErr('/a.ts', 2, 'e2'), mkErr('/a.ts', 3, 'e3')])
+    fb.flush('session-1')
+    fb.handle('/a.ts', 'session-1', [mkErr('/a.ts', 3, 'e3')])
+    fb.flush('session-1')
+    check('LSP 反馈：第二次注入带进展（已消除 2 个，剩余 1 个）',
+      injected.length === 2 && injected[1].includes('已消除 2 个') && injected[1].includes('剩余 1 个'), injected[1])
+
+    fb.handle('/a.ts', 'session-1', [mkErr('/a.ts', 1, 'e1'), mkErr('/a.ts', 2, 'e2')])
+    fb.flush('session-1')
+    const afterCap = injected.length
+    fb.handle('/a.ts', 'session-1', [mkErr('/a.ts', 4, 'e4')])
+    fb.flush('session-1')
+    check('LSP 反馈：每轮注入上限 3 次（防死循环）', afterCap === 3 && injected.length === 3, `afterCap=${afterCap} total=${injected.length}`)
+
+    // 清零静默：错误全部消除 → onCleared 回调，不再注入
+    const cleared = []
+    let fb2Injections = 0
+    const fb2 = new LspFeedback({ enabled: true, inject: () => { fb2Injections += 1 }, onCleared: (sid) => cleared.push(sid), log: () => {} })
+    fb2.handle('/a.ts', 'session-1', [mkErr('/a.ts', 1, 'e1')])
+    fb2.flush('session-1')
+    fb2.handle('/a.ts', 'session-1', [])
+    fb2.flush('session-1')
+    check('LSP 反馈：错误清零 → 静默（onCleared 回调，不注入）',
+      cleared.length === 1 && cleared[0] === 'session-1' && fb2Injections === 1,
+      JSON.stringify({ cleared, injections: fb2Injections }))
+    fb.dispose()
+    fb2.dispose()
+  }
+
+  // 3) 逃生门关闭：零注入
+  {
+    const injected = []
+    const fb = new LspFeedback({ enabled: false, inject: (_s, t) => injected.push(t), log: () => {} })
+    fb.handle('/a.ts', 'session-1', [mkErr('/a.ts', 1, 'e1')])
+    fb.flush('session-1')
+    check('DSH_REMOTE_LSP_FEEDBACK=0 关闭时零注入', injected.length === 0, `n=${injected.length}`)
+    fb.dispose()
+  }
+}
+
+// ---- LSP 跨文件诊断：sessionId 回退归属（改 A 导致 B 报错，广播不再带空 sessionId）----
+{
+  const { LspManager } = await import(new URL('../lib/lsp.js', import.meta.url).href)
+  const fs = await import('node:fs')
+  fs.writeFileSync(`${TMP}/file-a.ts`, 'export const a = 1\n')
+  fs.writeFileSync(`${TMP}/file-b.ts`, 'import { missing } from "./file-a"\n')
+  fs.writeFileSync(`${TMP}/mock-lsp-cross.mjs`, `
+import { Buffer } from 'node:buffer'
+let buf = Buffer.alloc(0)
+function tryParse() {
+  const i = buf.indexOf('\\r\\n\\r\\n')
+  if (i < 0) return
+  const m = /Content-Length:\\s*(\\d+)/i.exec(buf.subarray(0, i).toString('ascii'))
+  if (!m) return
+  const len = Number(m[1])
+  if (buf.length < i + 4 + len) return
+  const payload = JSON.parse(buf.subarray(i + 4, i + 4 + len).toString('utf8'))
+  buf = buf.subarray(i + 4 + len)
+  handle(payload)
+}
+function send(obj) {
+  const s = JSON.stringify(obj)
+  process.stdout.write('Content-Length: ' + Buffer.byteLength(s) + '\\r\\n\\r\\n' + s)
+}
+function handle(msg) {
+  if (msg.method === 'initialize') {
+    send({ jsonrpc: '2.0', id: msg.id, result: { capabilities: { textDocumentSync: 1 } } })
+  } else if (msg.method === 'textDocument/didOpen' || msg.method === 'textDocument/didChange') {
+    // 跨文件：编辑 file-a 时，tsserver 推送受影响文件 file-b 的诊断（uri 不在 docSessions）
+    const crossUri = msg.params.textDocument.uri.replace('file-a.ts', 'file-b.ts')
+    send({ jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: {
+      uri: crossUri,
+      diagnostics: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } }, severity: 1, message: '跨文件引用错误：file-b 引用了 file-a 不存在的符号', source: 'mock-cross' }],
+    } })
+  }
+}
+process.stdin.on('data', (c) => { buf = Buffer.concat([buf, c]); tryParse() })
+`)
+  const got = []
+  const mgr = new LspManager({
+    onDiagnostics: (path, sessionId, diags) => { got.push({ path, sessionId, diags }) },
+    cmdOverride: { typescript: ['node', `${TMP}/mock-lsp-cross.mjs`] },
+    log: () => {},
+  })
+  mgr.notifyFileChanged(`${TMP}/file-a.ts`, 'session-1')
+  await new Promise((r) => setTimeout(r, 900))
+  const cross = got.find((g) => g.path.endsWith('file-b.ts'))
+  check('跨文件诊断 sessionId 回退归属（广播不再带空 sessionId）',
+    cross !== undefined && cross.sessionId === 'session-1' && cross.diags.length === 1 && cross.diags[0].message.includes('跨文件引用错误'),
+    JSON.stringify(cross))
+  mgr.dispose()
+}
+
+// ---- Kotlin pull：编辑后除被编辑文件外，拉取该 server 已打开的其余文档（跨文件覆盖）----
+{
+  const { LspManager } = await import(new URL('../lib/lsp.js', import.meta.url).href)
+  const fs = await import('node:fs')
+  fs.writeFileSync(`${TMP}/file-a.kt`, 'val a = 1\n')
+  fs.writeFileSync(`${TMP}/file-b.kt`, 'val b = a\n')
+  fs.writeFileSync(`${TMP}/mock-kotlin-pull.mjs`, `
+import { Buffer } from 'node:buffer'
+let buf = Buffer.alloc(0)
+function tryParse() {
+  for (;;) {
+    const i = buf.indexOf('\\r\\n\\r\\n')
+    if (i < 0) return
+    const m = /Content-Length:\\s*(\\d+)/i.exec(buf.subarray(0, i).toString('ascii'))
+    if (!m) return
+    const len = Number(m[1])
+    if (buf.length < i + 4 + len) return
+    const payload = JSON.parse(buf.subarray(i + 4, i + 4 + len).toString('utf8'))
+    buf = buf.subarray(i + 4 + len)
+    handle(payload)
+  }
+}
+function send(obj) {
+  const s = JSON.stringify(obj)
+  process.stdout.write('Content-Length: ' + Buffer.byteLength(s) + '\\r\\n\\r\\n' + s)
+}
+function handle(msg) {
+  if (msg.method === 'initialize') {
+    send({ jsonrpc: '2.0', id: msg.id, result: { capabilities: { textDocumentSync: 1 } } })
+  } else if (msg.method === 'textDocument/diagnostic') {
+    // pull 模式：回应 textDocument/diagnostic 请求（非空 items 避免空结果重试）
+    send({ jsonrpc: '2.0', id: msg.id, result: { items: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 1 } }, severity: 1, message: 'pulled', source: 'mock-pull' }] } })
+  }
+}
+process.stdin.on('data', (c) => { buf = Buffer.concat([buf, c]); tryParse() })
+`)
+  const pulled = []
+  const mgr = new LspManager({
+    onDiagnostics: (path) => { pulled.push(path) },
+    cmdOverride: { kotlin: ['node', `${TMP}/mock-kotlin-pull.mjs`] },
+    log: () => {},
+  })
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+  mgr.notifyFileChanged(`${TMP}/file-a.kt`, 'session-1')
+  await sleep(1500)
+  mgr.notifyFileChanged(`${TMP}/file-b.kt`, 'session-1')
+  await sleep(1500)
+  // 重新编辑 A（内容变化）→ 应同时 pull A 与 B（跨文件覆盖）
+  fs.writeFileSync(`${TMP}/file-a.kt`, 'val a = 2\n')
+  const before = pulled.length
+  mgr.notifyFileChanged(`${TMP}/file-a.kt`, 'session-1')
+  await sleep(1500)
+  const afterPulls = pulled.slice(before)
+  check('Kotlin pull 覆盖已打开文档（重编辑 A 后 A+B 都被拉取）',
+    afterPulls.some((p) => p.endsWith('file-a.kt')) && afterPulls.some((p) => p.endsWith('file-b.kt')),
+    JSON.stringify(afterPulls.map((p) => p.split('/').pop())))
   mgr.dispose()
 }
 

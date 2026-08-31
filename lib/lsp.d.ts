@@ -100,6 +100,10 @@ export declare class LspManager {
     private handleServerRequest;
     private respond;
     private syncDoc;
+    /** pull 模式：同步后拉取该 server 全部已打开文档的诊断（跨文件覆盖）。 */
+    private pullAllDiagnostics;
+    /** 诊断归属会话：优先该文档的 didOpen 会话，跨文件受影响文档回退到最近触发会话。 */
+    private sessionOf;
     /** 把一条 LSP Diagnostic（push 或 pull 两种来源共用）转成桥接的 wire 结构。 */
     private toWireDiagnostic;
     /** pull 模式诊断：请求 textDocument/diagnostic，非空就回调，空则节流重试（IntelliJ 分析异步，就绪后仍需 20~30s 才算完）。 */
