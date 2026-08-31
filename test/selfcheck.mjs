@@ -53,6 +53,10 @@ const check = (label, cond, detail = '') => {
   console.log(`${cond ? 'PASS' : 'FAIL'}  ${label}${detail ? `  (${detail})` : ''}`)
 }
 
+// 版本兼容断言：live 服务器在部署 0.13.0 前仍是 0.12.0，两版都过；
+// 部署 0.13.0 后收紧为 === '0.13.0'。
+const isVersion = (v) => v === '0.12.0' || v === '0.13.0'
+
 let conn
 for (const token of [undefined, ...tokens]) {
   try {
@@ -70,10 +74,10 @@ if (conn === undefined) {
 const { ws, msgs } = conn
 
 const hello = await awaitMsg(msgs, (m) => m.type === 'hello', 'hello')
-check('hello 版本 0.12.0', hello?.version === '0.12.0', hello?.version)
+check('hello 版本（0.12.0/0.13.0 兼容）', isVersion(hello?.version), hello?.version)
 
 const boot = await awaitMsg(msgs, (m) => m.type === 'server_boot', 'server_boot')
-check('server_boot 版本 0.12.0', boot?.version === '0.12.0', boot?.version)
+check('server_boot 版本（0.12.0/0.13.0 兼容）', isVersion(boot?.version), boot?.version)
 
 // 子代理会话标题：打印有 parentSessionId 的会话（人工核对凝练度）
 const subs = (hello?.sessions ?? []).filter((s) => s.parentSessionId)

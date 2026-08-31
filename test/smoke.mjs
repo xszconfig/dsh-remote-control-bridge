@@ -13,6 +13,8 @@ const TMP = process.env.DSH_HOME
 
 // 自动续跑测试：低延迟 + 预写待办
 process.env.DSH_REMOTE_RESUME_DELAY_MS = '300'
+// 离线冒烟：关闭热重载 watcher（避免对 lib/ 挂 watcher；/remote/reload、/remote/hot 端点仍注册）
+process.env.DSH_REMOTE_HOT_RELOAD = '0'
 {
   const fsInit = await import('node:fs')
   const workHome = process.env.DSH_HOME ?? (process.env.HOME + '/.dsh')
@@ -29,6 +31,10 @@ const check = (label, cond, detail = '') => {
   results.push({ label, pass: !!cond })
   console.log(`${cond ? 'PASS' : 'FAIL'}  ${label}${detail ? `  (${detail})` : ''}`)
 }
+
+// 版本兼容断言：live 服务器在部署 0.13.0 前仍是 0.12.0，两版都过；
+// 部署 0.13.0 后收紧为 === '0.13.0'。
+const isVersion = (v) => v === '0.12.0' || v === '0.13.0'
 
 // ---- mock ctx ----
 const routes = new Map()
@@ -291,6 +297,11 @@ const mockCtx = {
   on(ev, cb) { listeners.set(ev, cb) },
   events: { on: (ev, cb) => { eventsListeners.set(ev, cb) } },
   effect() {},
+  // 自举热重载：shell 用 ctx.plugin 挂载 core；离线 mock 直接 mod.apply(mockCtx) 并返回带 dispose 的 fiber
+  plugin(mod) {
+    mod.apply(mockCtx)
+    return { dispose: async () => {} }
+  },
 }
 
 // ---- 测试服务器（bridge WS + 伪 mux WS + /api/respond）----
@@ -331,7 +342,7 @@ await new Promise((r) => httpServer.listen(0, '127.0.0.1', r))
 const port = httpServer.address().port
 mockCtx.webServer.port = port
 
-apply(mockCtx)
+await apply(mockCtx)
 check('exports', name === 'dsh-remote-control-bridge' && Array.isArray(inject) && inject.includes('webServer') && inject.includes('sessionPersistence'))
 
 // boot 立即注入：agent 已在 boot 时挂载（本例 mock 里 list() 直接返回 running agent），
@@ -355,7 +366,16 @@ check('bridge 已连接 mux WebSocket', muxReady)
   const req = { url: '/remote/ping', headers: { host: '127.0.0.1' }, socket: { remoteAddress: '127.0.0.1' } }
   await routes.get('exact:/remote/ping')(req, res)
   const j = JSON.parse(res.body)
-  check('ping 0.12.0', j.ok === true && j.version === '0.12.0', j.version)
+  check('ping 版本（0.12.0/0.13.0 兼容）', j.ok === true && isVersion(j.version), j.version)
+}
+
+// 热重载自举端点：GET /remote/hot 返回 shell/core 状态（禁止在 smoke 里真实触发 /remote/reload）
+{
+  const res = { status: 200, body: '', writeHead(s, h) { this.status = s }, end(b) { this.body = b.toString() } }
+  const req = { url: '/remote/hot', headers: { host: '127.0.0.1' }, socket: { remoteAddress: '127.0.0.1' } }
+  await routes.get('exact:/remote/hot')(req, res)
+  const j = JSON.parse(res.body)
+  check('/remote/hot ok + reloads>=0 + shell 字符串', j.ok === true && Number.isInteger(j.reloads) && j.reloads >= 0 && typeof j.shell === 'string', JSON.stringify(j))
 }
 
 // 手机客户端
@@ -494,7 +514,7 @@ const hello = phone.msgs.find((m) => m.type === 'hello')
   agentStatus = 'running'
 }
 
-check('hello 0.12.0 含三挂起队列', hello?.version === '0.12.0' && Array.isArray(hello?.pendingApprovals) && Array.isArray(hello?.pendingRemoteApprovals) && Array.isArray(hello?.pendingQuestions), hello?.version)
+check('hello 版本（0.12.0/0.13.0 兼容）含三挂起队列', isVersion(hello?.version) && Array.isArray(hello?.pendingApprovals) && Array.isArray(hello?.pendingRemoteApprovals) && Array.isArray(hello?.pendingQuestions), hello?.version)
 
 // ---- 会话列表合并持久化层（冷会话可见 + 标题/工作区/排序）----
 check('hello 合并冷会话', hello?.sessions?.some((s) => s.id === 'cold-1') === true && hello?.sessions?.some((s) => s.id === 'cold-2') === true, JSON.stringify(hello?.sessions?.map((s) => `${s.id}→${s.workspaceId}`)))
@@ -900,7 +920,7 @@ const approvalListener = listeners.get('approval/request')
 {
   const phone3 = await openPhone()
   const boot = await awaitMsg(phone3.msgs, (m) => m.type === 'server_boot', 'server_boot 推送')
-  check('重连客户端收到 server_boot（版本 + notes）', boot.version === '0.12.0' && Array.isArray(boot.notes), JSON.stringify(boot))
+  check('重连客户端收到 server_boot（版本 + notes）', isVersion(boot.version) && Array.isArray(boot.notes), JSON.stringify(boot))
   phone3.ws.close()
 }
 
