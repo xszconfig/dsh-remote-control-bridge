@@ -975,6 +975,54 @@ process.stdin.on('data', (c) => { buf = Buffer.concat([buf, c]); tryParse() })
   mgr.dispose()
 }
 
+// ---- Kotlin 项目根定位 + spawn 环境纯函数（修复 kotlin LSP 诊断失效）----
+{
+  const { kotlinProjectRoot, kotlinSpawnEnv, KOTLIN_STRIP_PROXY_VARS } = await import(new URL('../lib/lsp.js', import.meta.url).href)
+  const fs = await import('node:fs')
+  const os = await import('node:os')
+  const path = await import('node:path')
+
+  // 造嵌套工程：仓库根含 settings.gradle.kts + build.gradle.kts，模块目录只含 build.gradle.kts
+  const projRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-kotlin-root-'))
+  const composeAppSrc = path.join(projRoot, 'composeApp', 'src', 'main', 'kotlin')
+  fs.mkdirSync(composeAppSrc, { recursive: true })
+  fs.writeFileSync(path.join(projRoot, 'settings.gradle.kts'), 'rootProject.name = "x"\n')
+  fs.writeFileSync(path.join(projRoot, 'build.gradle.kts'), 'plugins { kotlin("jvm") apply false }\n')
+  fs.writeFileSync(path.join(projRoot, 'composeApp', 'build.gradle.kts'), 'plugins { kotlin("jvm") }\n')
+  const kt = path.join(composeAppSrc, 'App.kt')
+  fs.writeFileSync(kt, 'val x = 1\n')
+  check('Kotlin 根定位：模块深处 .kt → 含 settings 的仓库根（非模块目录）',
+    kotlinProjectRoot(kt) === projRoot && kotlinProjectRoot(kt) !== path.join(projRoot, 'composeApp'),
+    JSON.stringify({ got: kotlinProjectRoot(kt), want: projRoot }))
+
+  // 无 settings：取最上层含任一标记的目录
+  const noSettings = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-kotlin-nosettings-'))
+  fs.mkdirSync(path.join(noSettings, 'a', 'b'), { recursive: true })
+  fs.writeFileSync(path.join(noSettings, 'build.gradle'), '')
+  fs.writeFileSync(path.join(noSettings, 'a', 'build.gradle.kts'), '')
+  const kt2 = path.join(noSettings, 'a', 'b', 'x.kt')
+  fs.writeFileSync(kt2, 'val y = 2\n')
+  check('Kotlin 根定位：无 settings 时取最上层含标记目录', kotlinProjectRoot(kt2) === noSettings, kotlinProjectRoot(kt2))
+
+  // 都没有标记：退回文件所在目录
+  const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-kotlin-bare-'))
+  fs.mkdirSync(path.join(bare, 'sub'), { recursive: true })
+  const kt3 = path.join(bare, 'sub', 'z.kt')
+  fs.writeFileSync(kt3, 'val z = 3\n')
+  check('Kotlin 根定位：无任何标记退回文件目录', kotlinProjectRoot(kt3) === path.join(bare, 'sub'), kotlinProjectRoot(kt3))
+
+  // spawn 环境：剥离代理、注入 GRADLE_USER_HOME/JAVA_HOME、不覆盖已有值
+  const env = kotlinSpawnEnv(
+    { PATH: '/usr/bin', http_proxy: 'http://x:8080', HTTPS_PROXY: 'http://y:8080', JAVA_HOME: '', GRADLE_USER_HOME: '' },
+    { gradleUserHome: '/Users/t/.gradle', javaHome: '/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home' },
+  )
+  check('kotlinSpawnEnv 剥离代理变量', env.http_proxy === undefined && env.HTTPS_PROXY === undefined && env.https_proxy === undefined && env.all_proxy === undefined, JSON.stringify(env))
+  check('kotlinSpawnEnv 注入 GRADLE_USER_HOME 与 JAVA_HOME', env.GRADLE_USER_HOME === '/Users/t/.gradle' && env.JAVA_HOME === '/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home', JSON.stringify({ g: env.GRADLE_USER_HOME, j: env.JAVA_HOME }))
+  const env2 = kotlinSpawnEnv({ JAVA_HOME: '/keep/me', GRADLE_USER_HOME: '/keep/g' }, { gradleUserHome: '/x', javaHome: '/y' })
+  check('kotlinSpawnEnv 不覆盖已有 JAVA_HOME/GRADLE_USER_HOME', env2.JAVA_HOME === '/keep/me' && env2.GRADLE_USER_HOME === '/keep/g', JSON.stringify(env2))
+  check('KOTLIN_STRIP_PROXY_VARS 含 http_proxy/https_proxy', KOTLIN_STRIP_PROXY_VARS.includes('http_proxy') && KOTLIN_STRIP_PROXY_VARS.includes('https_proxy'), JSON.stringify(KOTLIN_STRIP_PROXY_VARS))
+}
+
 // ---- Debug：真实 Node Inspector 子进程 —— REST 启动 → 断点命中 → 调用栈/变量 → 单步 → 恢复 → 退出 ----
 {
   const fs = await import('node:fs')

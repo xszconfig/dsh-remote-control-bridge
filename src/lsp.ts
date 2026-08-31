@@ -10,7 +10,7 @@
  * - server 崩溃后自动清理，30s 内不重启同语言。
  */
 import { spawn, type ChildProcess } from 'node:child_process'
-import { existsSync, readFileSync, realpathSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, realpathSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -50,6 +50,58 @@ const LANGS: Record<string, LanguageConfig> = {
 
 const DIAG_THROTTLE_MS = 400
 const RESTART_BACKOFF_MS = 30_000
+
+/** Kotlin 项目根识别的构建文件标记（settings 单独优先）。 */
+const KOTLIN_ROOT_MARKERS = ['build.gradle.kts', 'build.gradle', 'settings.gradle.kts', 'settings.gradle', 'pom.xml']
+const KOTLIN_SETTINGS_MARKERS = ['settings.gradle.kts', 'settings.gradle']
+/** 向上最多遍历的目录层数。 */
+const KOTLIN_ROOT_MAX_DEPTH = 20
+
+/**
+ * Kotlin 项目根定位（纯函数，便于单测）：向上遍历（默认 20 层）收集所有含构建标记的目录，
+ * 优先取最上层含 settings.gradle(.kts) 的目录；没有 settings 时取最上层含任一标记的目录；
+ * 都没有则退回文件所在目录。
+ *
+ * 修复背景：旧实现向上找到第一个含 build 文件的目录就停，会把 composeApp 模块目录误当项目根
+ * （缺 settings.gradle.kts 的仓库根），导致 IntelliJ 导入缺 content root → Kotlin 文件
+ * 被判 not-under-content-root → 0 诊断。
+ */
+export function kotlinProjectRoot(path: string): string {
+  const start = dirname(path)
+  const withSettings: string[] = []
+  const withAny: string[] = []
+  let dir = start
+  for (let i = 0; i < KOTLIN_ROOT_MAX_DEPTH; i++) {
+    if (KOTLIN_SETTINGS_MARKERS.some((m) => existsSync(join(dir, m)))) withSettings.push(dir)
+    if (KOTLIN_ROOT_MARKERS.some((m) => existsSync(join(dir, m)))) withAny.push(dir)
+    const parent = dirname(dir)
+    if (parent === dir) break
+    dir = parent
+  }
+  // 遍历自下而上，数组末尾即最上层（最接近文件系统根的祖先目录）
+  const topSettings = withSettings[withSettings.length - 1]
+  if (topSettings !== undefined) return topSettings
+  const topAny = withAny[withAny.length - 1]
+  if (topAny !== undefined) return topAny
+  return start
+}
+
+/** Kotlin（IntelliJ 内核）spawn 环境里需要剥离的代理变量：进程网络不可用时代理会把 Gradle 下载/解析导进黑洞。 */
+export const KOTLIN_STRIP_PROXY_VARS = ['http_proxy', 'https_proxy', 'HTTP_PROXY', 'HTTPS_PROXY', 'all_proxy', 'ALL_PROXY', 'no_proxy', 'NO_PROXY']
+
+/**
+ * 构造 Kotlin（IntelliJ 内核）spawn 环境变量（纯函数，便于单测）：
+ * 1. 剥离代理变量（避免代理黑洞阻断 Gradle 分发/依赖解析）；
+ * 2. 未显式设置时注入 GRADLE_USER_HOME（确保 wrapper 分发命中本机 ~/.gradle 缓存）；
+ * 3. 未显式设置时注入 JAVA_HOME（Gradle 兼容 JDK，作为自动探测失败时的防御兜底）。
+ */
+export function kotlinSpawnEnv(base: NodeJS.ProcessEnv, opts: { gradleUserHome: string; javaHome?: string }): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...base }
+  for (const k of KOTLIN_STRIP_PROXY_VARS) delete env[k]
+  if (env.GRADLE_USER_HOME === undefined || env.GRADLE_USER_HOME === '') env.GRADLE_USER_HOME = opts.gradleUserHome
+  if (opts.javaHome !== undefined && opts.javaHome !== '' && (env.JAVA_HOME === undefined || env.JAVA_HOME === '')) env.JAVA_HOME = opts.javaHome
+  return env
+}
 
 interface ServerState {
   proc: ChildProcess
@@ -247,17 +299,36 @@ export class LspManager {
     return join(homedir(), '.dsh', 'kotlin-lsp', 'index')
   }
 
-  /** Kotlin 需要项目根（含 build 文件）才能导入分析；找不到就退回文件所在目录。 */
-  private kotlinProjectRoot(path: string): string {
-    const markers = ['build.gradle.kts', 'build.gradle', 'settings.gradle.kts', 'settings.gradle', 'pom.xml']
-    let dir = dirname(path)
-    for (let i = 0; i < 20; i++) {
-      if (markers.some((m) => existsSync(join(dir, m)))) return dir
-      const parent = dirname(dir)
-      if (parent === dir) break
-      dir = parent
+  /**
+   * 找 Gradle 兼容 JDK（Java 17~23）作为防御性 JAVA_HOME。
+   * 背景：intellij-server 自带 JBR-25（Java 25），而 Gradle 8.11.1 只支持到 Java 23，
+   * 若 IntelliJ 内核自动探测不到兼容 JDK，Gradle 守护进程会落在 JBR-25 上 → Groovy 编译
+   * 构建脚本时报 "Unsupported class file major version 69"。注入 JAVA_HOME 让内核的
+   * tryJavaFromJavaHome 兜底（不兼容时内核会自行忽略，不会误伤）。
+   */
+  private gradleJavaHome(): string | undefined {
+    const fromEnv = process.env.JAVA_HOME
+    if (fromEnv !== undefined && fromEnv !== '' && existsSync(join(fromEnv, 'bin', 'java'))) return fromEnv
+    const candidates = [
+      '/opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home',
+      '/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home',
+      '/opt/homebrew/opt/openjdk@23/libexec/openjdk.jdk/Contents/Home',
+      '/usr/local/opt/openjdk@21/libexec/openjdk.jdk/Contents/Home',
+      '/usr/local/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home',
+    ]
+    for (const c of candidates) {
+      if (existsSync(join(c, 'bin', 'java'))) return c
     }
-    return dirname(path)
+    // Android Studio 自带 JBR（通常 Java 21）：/Applications/Android Studio*.app/Contents/jbr/Contents/Home
+    try {
+      for (const a of readdirSync('/Applications')) {
+        if (a.startsWith('Android Studio')) {
+          const home = join('/Applications', a, 'Contents', 'jbr', 'Contents', 'Home')
+          if (existsSync(join(home, 'bin', 'java'))) return home
+        }
+      }
+    } catch { /* 无 /Applications 读权限等，忽略 */ }
+    return undefined
   }
 
   private kotlinCmd(): string[] {
@@ -347,16 +418,15 @@ export class LspManager {
       return undefined
     }
     try {
-      const proc = spawn(bin, cmd.slice(1), {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        // Kotlin（IntelliJ 内核）默认堆太小会在索引 stdlib 时 OOM：未显式设置时给 4g
-        env: {
-          ...process.env,
-          ...(lang === 'kotlin' && (process.env.IJ_JAVA_OPTIONS === undefined || process.env.IJ_JAVA_OPTIONS === '')
-            ? { IJ_JAVA_OPTIONS: '-Xmx4g' }
-            : {}),
-        },
-      })
+      // Kotlin（IntelliJ 内核）spawn 环境：剥离代理黑洞 + 注入 GRADLE_USER_HOME + 防御性 JAVA_HOME。
+      // 默认堆太小会在索引 stdlib 时 OOM：未显式设置时给 4g。
+      const env = lang === 'kotlin'
+        ? kotlinSpawnEnv(process.env, { gradleUserHome: join(homedir(), '.gradle'), javaHome: this.gradleJavaHome() })
+        : { ...process.env }
+      if (lang === 'kotlin' && (env.IJ_JAVA_OPTIONS === undefined || env.IJ_JAVA_OPTIONS === '')) {
+        env.IJ_JAVA_OPTIONS = '-Xmx4g'
+      }
+      const proc = spawn(bin, cmd.slice(1), { stdio: ['pipe', 'pipe', 'pipe'], env })
       const state: ServerState = {
         proc,
         pending: new Map(),
@@ -405,7 +475,7 @@ export class LspManager {
       const isTs = lang === 'typescript' || lang === 'javascript'
       // Kotlin 的 workspace root 用项目根（含 build 文件），并解析符号链接（macOS /tmp→/private/tmp），
       // 否则 buildTools 的 key 与 server 解析出的文件夹 URI 对不上，导入不会触发。
-      let kotlinRoot = isKotlin ? this.kotlinProjectRoot(path) : dirname(path)
+      let kotlinRoot = isKotlin ? kotlinProjectRoot(path) : dirname(path)
       if (isKotlin) {
         try { kotlinRoot = realpathSync(kotlinRoot) } catch { /* 保留未解析路径 */ }
       }
