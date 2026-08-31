@@ -144,12 +144,11 @@ export function apply(ctx: Context) {
   } else {
     logger.info('WORK', '无待办事项')
   }
-  // 自动续跑（根治版）：不再是一次性定时器——首次快速尝试 + 之后每 20s 持续重试，
-  // 直到指纹匹配的待办成功注入；agent 晚挂载/晚打开都会在下一轮或 agent/status 触发时补上。
+  // 自动续跑（根治版）：boot 立即尝试一次 + agent 挂载（agent/created）/上线（agent/status running）
+  // 事件即时补注入 + 定时器兜底。首轮兜底间隔可用 DSH_REMOTE_RESUME_DELAY_MS 调小（测试用）；
+  // 事件触发已覆盖绝大多数场景，定时器只兜「事件早于 bridge 注册而错过 / agent 一直不挂载」等极端情况。
+  // 具体调度放在 resumeTick 定义之后（此处 resumeTick 尚未声明，无法立即调用）。
   const resumeDelayMs = Number(process.env.DSH_REMOTE_RESUME_DELAY_MS ?? 20_000)
-  setTimeout(() => resumeTick(), resumeDelayMs).unref?.()
-  const resumeInterval = setInterval(() => resumeTick(), 20_000)
-  resumeInterval.unref?.()
 
   const upsertDevice = (deviceId: string, name: string, model?: string): StoredDevice => {
     const now = Date.now()
@@ -683,7 +682,11 @@ export function apply(ctx: Context) {
     t.unref?.()
   }
   /** 重启后恢复：快照里活队列没有的消息（按 id 或文本去重）重新注入；恢复完清掉快照。 */
+  // 与 tryResumeIfPending 同款重入防护：followup 会同步唤醒 idle agent → agent/status running →
+  // 再次调用 restoreQueueIfLost。若在清快照前重入，同一条丢失消息会被重复注入。
+  const restoringSessions = new Set<string>()
   const restoreQueueIfLost = (sessionId: string): void => {
+    if (restoringSessions.has(sessionId)) return
     try {
       const work = loadWorkState(WORK_FILE)
       const snap = work?.queues?.[sessionId]
@@ -703,8 +706,13 @@ export function apply(ctx: Context) {
         return
       }
       logger.info('QUEUE', `会话 ${sessionId.slice(0, 12)} 恢复丢失的排队消息 ${missing.length} 条`)
-      for (const it of missing) {
-        agent.followup(createUserMessage({ content: [{ type: 'text', text: it.text }], source: { kind: 'user' } }))
+      restoringSessions.add(sessionId)
+      try {
+        for (const it of missing) {
+          agent.followup(createUserMessage({ content: [{ type: 'text', text: it.text }], source: { kind: 'user' } }))
+        }
+      } finally {
+        restoringSessions.delete(sessionId)
       }
       const queues = { ...(work?.queues ?? {}) }
       delete queues[sessionId]
@@ -720,9 +728,14 @@ export function apply(ctx: Context) {
   // agent 一上线（agent/status running）立即补注入；优先唤醒 work.sessionId 所属会话。
   const resumeFingerprintOf = (work: NonNullable<ReturnType<typeof loadWorkState>>): string =>
     `${work.activity ?? ''}\n${work.pending.join('\n')}\n${work.sessionId ?? ''}`
+  // 重入防护：followup 会同步唤醒 idle agent（idle→running 触发 agent/status），
+  // 而 agent/status 处理器会再次调用 tryResumeIfPending——若在指纹写盘前重入，同一批待办会被注入两次。
+  // 用进程内布尔锁阻断「同批注入」期间的任何重入；跨 tick 的重复由磁盘指纹（resumeFingerprint）兜住。
+  let resumeInjecting = false
   const tryResumeIfPending = (): void => {
     try {
       if (process.env.DSH_REMOTE_RESUME === '0') return
+      if (resumeInjecting) return // 同一批待办正在注入（含 followup 同步触发的 agent/status 重入）
       const work = loadWorkState(WORK_FILE)
       if (work === null || work.pending.length === 0) return
       const fp = resumeFingerprintOf(work)
@@ -743,8 +756,13 @@ export function apply(ctx: Context) {
         '（最新状态见 ~/.dsh/remote-control-work.json，完成后请把该文件清空。）',
       ].join('\n')
       logger.info('WORK', `自动续跑：向 agent ${String(agent.id).slice(0, 8)} 注入续跑指令（待办 ${work.pending.length} 条）`)
-      agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }))
-      writeWorkState(WORK_FILE, { resumeFingerprint: fp })
+      resumeInjecting = true
+      try {
+        agent.followup(createUserMessage({ content: [{ type: 'text', text }], source: { kind: 'user' } }))
+        writeWorkState(WORK_FILE, { resumeFingerprint: fp })
+      } finally {
+        resumeInjecting = false
+      }
     } catch (e: unknown) {
       logger.warn('WORK', `自动续跑尝试失败: ${String(e)}`)
     }
@@ -759,6 +777,13 @@ export function apply(ctx: Context) {
       logger.warn('QUEUE', `队列恢复巡检失败: ${String(e)}`)
     }
   }
+  // 立即尝试一次：agent 在 bridge 加载前就已挂载（agent/created 早于本插件注册而错过）时也能即时注入，
+  // 不必等 20s 兜底定时器——这是「重启后代理挂载要等好久才续上」的主要延迟来源之一。
+  resumeTick()
+  // 兜底重试：首轮 resumeDelayMs 后、此后每 20s 一次；事件触发已覆盖绝大多数场景。
+  setTimeout(() => resumeTick(), resumeDelayMs).unref?.()
+  const resumeInterval = setInterval(() => resumeTick(), 20_000)
+  resumeInterval.unref?.()
 
   // ---- Deep Diving：模型请求起止 → 手机指示条 ----
   // modelStreams：会话 → 进行中的模型请求开始时间。订阅时下发，
@@ -947,6 +972,14 @@ export function apply(ctx: Context) {
     if (event.type === 'tool/call') {
       for (const p of toolFilePaths(event.data)) lsp.notifyFileChanged(p, String(session.id))
     }
+  })
+
+  // agent 挂载完成（含重启后恢复的持久化会话）：不必等它跑起来（agent/status running），
+  // 也不用等 20s 兜底定时器——这是「重启后代理挂载要等好久才续上」的另一个延迟来源。
+  ctx.on('agent/created', ({ agent }) => {
+    broadcast({ type: 'agent_status', sessionId: String(agent.id), status: agent.status })
+    tryResumeIfPending()
+    restoreQueueIfLost(String(agent.id))
   })
 
   ctx.on('agent/status', ({ agent, status }) => {
