@@ -355,7 +355,7 @@ check('bridge 已连接 mux WebSocket', muxReady)
   const req = { url: '/remote/ping', headers: { host: '127.0.0.1' }, socket: { remoteAddress: '127.0.0.1' } }
   await routes.get('exact:/remote/ping')(req, res)
   const j = JSON.parse(res.body)
-  check('ping 0.11.10', j.ok === true && j.version === '0.11.10', j.version)
+  check('ping 0.12.0', j.ok === true && j.version === '0.12.0', j.version)
 }
 
 // 手机客户端
@@ -494,7 +494,7 @@ const hello = phone.msgs.find((m) => m.type === 'hello')
   agentStatus = 'running'
 }
 
-check('hello 0.11.10 含三挂起队列', hello?.version === '0.11.10' && Array.isArray(hello?.pendingApprovals) && Array.isArray(hello?.pendingRemoteApprovals) && Array.isArray(hello?.pendingQuestions), hello?.version)
+check('hello 0.12.0 含三挂起队列', hello?.version === '0.12.0' && Array.isArray(hello?.pendingApprovals) && Array.isArray(hello?.pendingRemoteApprovals) && Array.isArray(hello?.pendingQuestions), hello?.version)
 
 // ---- 会话列表合并持久化层（冷会话可见 + 标题/工作区/排序）----
 check('hello 合并冷会话', hello?.sessions?.some((s) => s.id === 'cold-1') === true && hello?.sessions?.some((s) => s.id === 'cold-2') === true, JSON.stringify(hello?.sessions?.map((s) => `${s.id}→${s.workspaceId}`)))
@@ -900,7 +900,7 @@ const approvalListener = listeners.get('approval/request')
 {
   const phone3 = await openPhone()
   const boot = await awaitMsg(phone3.msgs, (m) => m.type === 'server_boot', 'server_boot 推送')
-  check('重连客户端收到 server_boot（版本 + notes）', boot.version === '0.11.10' && Array.isArray(boot.notes), JSON.stringify(boot))
+  check('重连客户端收到 server_boot（版本 + notes）', boot.version === '0.12.0' && Array.isArray(boot.notes), JSON.stringify(boot))
   phone3.ws.close()
 }
 
