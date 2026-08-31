@@ -29,7 +29,7 @@ export interface AgentSummary {
     status: AgentStatusWire;
     depth: number;
 }
-export type EventKind = 'user_message' | 'assistant_message' | 'tool_call' | 'tool_result' | 'think' | 'error' | 'system';
+export type EventKind = 'user_message' | 'assistant_message' | 'tool_call' | 'tool_result' | 'think' | 'command' | 'error' | 'system';
 export interface EventProjection {
     seq: number;
     type: EventKind;
@@ -39,6 +39,19 @@ export interface EventProjection {
     toolResult?: string;
     toolError?: boolean;
     timestamp: number;
+    /**
+     * 斜杠命令生命周期（DSH `commands` 服务的 command/run + command/done 会话事件投影；
+     * 与 Web composer 路由同一条执行链）。客户端按 commandId 把 running 行与 done 行合并成一行。
+     */
+    commandId?: string;
+    /** 命令名（不含斜杠，如 "compact"）。 */
+    commandName?: string;
+    /** 命令参数（rawInput 去首尾空白；无参数为 ''）。 */
+    commandArgs?: string;
+    /** running=执行中（command/run 投影）；done=已完结（command/done 投影）；error=未注册等准入失败（瞬时行，不落会话日志）。 */
+    commandStatus?: 'running' | 'done' | 'error';
+    /** 仅 done/error 行：handler 结果是否成功（kind === 'success'）。 */
+    commandOk?: boolean;
     /** 工具调用/结果关联 id：客户端据此把失败的命令标红。 */
     callId?: string;
     /** 工具调用卡片形态（桌面端 presentCall 同源）：terminal=命令卡，generic/diff=通用卡。 */
@@ -263,6 +276,29 @@ export interface EvHistory {
     todos?: TodoWire[] | null;
     /** 当前 OPEN 轮次的开始时间（null = 无进行中的轮次）；中途切入会话也能立即显示 Deep diving 标签。 */
     turnSince?: number | null;
+    /**
+     * 该会话可用的斜杠命令清单（DSH commands 服务 list(agent)，与 Web composer 同一注册表；
+     * 名称+一句话说明，客户端输入 "/" 时弹候选）。冷会话/无 commands 服务时为空数组。
+     */
+    commands?: CommandWire[];
+}
+/** 斜杠命令注册表条目（DSH CommandDescriptor 的 wire 投影；服务端权威，客户端不做本地枚举）。 */
+export interface CommandWire {
+    name: string;
+    description: string;
+    /** 命令参数提示（如 plan 的 "off|message"）；无参数命令缺省。 */
+    input?: CommandInputWire;
+}
+export interface CommandInputWire {
+    hint: string;
+    /** 是否接受图片附件（手机端当前只发文本，字段保留以对齐 Web）。 */
+    images?: boolean;
+}
+/** 命令注册表变更（DSH commands/change 事件）：重读各活跃会话的命令清单推给手机。 */
+export interface EvCommandsUpdate {
+    type: 'commands_update';
+    sessionId: string;
+    commands: CommandWire[];
 }
 /** 排队消息投影：placement = queued(下一轮)/steering(用户插队中)/context(系统注入)。 */
 export interface QueueItemWire {
@@ -454,7 +490,7 @@ export interface EvDeviceRevoked {
     type: 'device_revoked';
     deviceId: string;
 }
-export type ServerEvent = EvHello | EvSessions | EvAgents | EvEvent | EvHistory | EvSessionQueue | EvLogsRequest | EvModelWaiting | EvModelWaitingDone | EvDeepDivingTick | EvTurnStatus | EvThinkDelta | EvDiagnostics | EvGoalUpdate | EvTodosUpdate | EvDebugState | EvDebugOutput | EvDebugVariables | EvServerBoot | EvSessionTitle | EvSessionUpsert | EvAgentStatus | EvApprovalRequest | EvApprovalResolved | EvQuestionRequest | EvQuestionResolved | EvError | EvDeviceRegistered | EvDeviceRevoked;
+export type ServerEvent = EvHello | EvSessions | EvAgents | EvEvent | EvHistory | EvSessionQueue | EvLogsRequest | EvModelWaiting | EvModelWaitingDone | EvDeepDivingTick | EvTurnStatus | EvThinkDelta | EvDiagnostics | EvGoalUpdate | EvTodosUpdate | EvCommandsUpdate | EvDebugState | EvDebugOutput | EvDebugVariables | EvServerBoot | EvSessionTitle | EvSessionUpsert | EvAgentStatus | EvApprovalRequest | EvApprovalResolved | EvQuestionRequest | EvQuestionResolved | EvError | EvDeviceRegistered | EvDeviceRevoked;
 export interface PingInfo {
     ok: true;
     version: string;
@@ -483,4 +519,4 @@ export interface DeviceRecord {
     createdAt: number;
     lastSeenAt: number;
 }
-export declare const BRIDGE_VERSION = "0.11.9";
+export declare const BRIDGE_VERSION = "0.11.10";

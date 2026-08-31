@@ -40,6 +40,8 @@ const sessionAppendLog = []
 const inboxRemoved = []
 const followupCalls = []
 const inboxSteered = []
+const commandExecuteCalls = []
+const eventsListeners = new Map()
 const inboxMessages = [
   { id: 'm1', source: { kind: 'user' }, content: [{ type: 'text', text: '排队的消息1' }] },
   { id: 'm2', source: { kind: 'user' }, content: [{ type: 'text', text: '排队的消息2' }] },
@@ -130,6 +132,26 @@ const mockCtx = {
   get(name) {
     if (name === 'goals') return this.goals
     if (name === 'sessionProjections') return this.sessionProjections
+    if (name === 'commands') {
+      // DSH commands 服务 mock：execute(agent, line, images, signal) →
+      // undefined=未注册/语法不符；对象=已执行。斜杠命令路由走这里（与 Web composer 同链）。
+      return {
+        list: (agent) => [
+          { name: 'compact', description: 'Compact older conversation history' },
+          { name: 'plan', description: 'Enter or leave plan mode', input: { hint: 'off|message' } },
+        ],
+        execute: async (agent, line, images, signal) => {
+          commandExecuteCalls.push({ agent, line, images, signal })
+          if (line === '/compact') {
+            return { commandId: 'cmd-smoke-1', result: { kind: 'success', text: 'Compacted 3 history items' } }
+          }
+          if (line === '/compact extra') {
+            return { commandId: 'cmd-smoke-2', result: { kind: 'error', text: 'Usage: /compact (no arguments)' } }
+          }
+          return undefined
+        },
+      }
+    }
     if (name === 'approval') {
       return {
         request: async (req) => {
@@ -165,6 +187,7 @@ const mockCtx = {
     return undefined
   },
   on(ev, cb) { listeners.set(ev, cb) },
+  events: { on: (ev, cb) => { eventsListeners.set(ev, cb) } },
   effect() {},
 }
 
@@ -223,7 +246,7 @@ check('bridge 已连接 mux WebSocket', muxReady)
   const req = { url: '/remote/ping', headers: { host: '127.0.0.1' }, socket: { remoteAddress: '127.0.0.1' } }
   await routes.get('exact:/remote/ping')(req, res)
   const j = JSON.parse(res.body)
-  check('ping 0.11.9', j.ok === true && j.version === '0.11.9', j.version)
+  check('ping 0.11.10', j.ok === true && j.version === '0.11.10', j.version)
 }
 
 // 手机客户端
@@ -322,7 +345,7 @@ const hello = phone.msgs.find((m) => m.type === 'hello')
   check('恢复后清理该会话快照', workAfter.queues === undefined || workAfter.queues['session-1'] === undefined, JSON.stringify(workAfter.queues))
 }
 
-check('hello 0.11.9 含三挂起队列', hello?.version === '0.11.9' && Array.isArray(hello?.pendingApprovals) && Array.isArray(hello?.pendingRemoteApprovals) && Array.isArray(hello?.pendingQuestions), hello?.version)
+check('hello 0.11.10 含三挂起队列', hello?.version === '0.11.10' && Array.isArray(hello?.pendingApprovals) && Array.isArray(hello?.pendingRemoteApprovals) && Array.isArray(hello?.pendingQuestions), hello?.version)
 
 // ---- 会话列表合并持久化层（冷会话可见 + 标题/工作区/排序）----
 check('hello 合并冷会话', hello?.sessions?.some((s) => s.id === 'cold-1') === true && hello?.sessions?.some((s) => s.id === 'cold-2') === true, JSON.stringify(hello?.sessions?.map((s) => `${s.id}→${s.workspaceId}`)))
@@ -346,6 +369,54 @@ check('未分组会话 workspaceId=null', hello?.sessions?.find((s) => s.id === 
   check('冷会话发送友好报错', err?.message?.includes('桌面端打开') === true, err?.message)
 }
 
+// ---- 斜杠命令路由：已注册命令走 commands.execute（与 Web composer 同链），普通文本发模型 ----
+{
+  phone.msgs.length = 0
+  const before = followupCalls.length
+  phone.ws.send(JSON.stringify({ type: 'send_message', sessionId: 'session-1', text: '/compact' }))
+  await new Promise((r) => setTimeout(r, 300))
+  check('斜杠命令走 commands.execute（不发模型）',
+    commandExecuteCalls.length === 1 && commandExecuteCalls[0].line === '/compact'
+    && Array.isArray(commandExecuteCalls[0].images) && commandExecuteCalls[0].images.length === 0
+    && commandExecuteCalls[0].signal !== undefined && followupCalls.length === before,
+    JSON.stringify(commandExecuteCalls.map((c) => c.line)))
+
+  phone.msgs.length = 0
+  phone.ws.send(JSON.stringify({ type: 'send_message', sessionId: 'session-1', text: '/nope' }))
+  const errRow = await awaitMsg(phone.msgs, (m) => m.type === 'event' && m.event?.type === 'command' && m.event.commandStatus === 'error', '未注册命令错误行')
+  check('未注册命令 → 会话内错误行（不发模型）',
+    errRow?.event?.commandName === 'nope' && errRow?.event?.commandOk === false
+    && typeof errRow?.event?.text === 'string' && followupCalls.length === before,
+    JSON.stringify(errRow?.event))
+
+  phone.msgs.length = 0
+  phone.ws.send(JSON.stringify({ type: 'send_message', sessionId: 'session-1', text: '普通文本消息' }))
+  await new Promise((r) => setTimeout(r, 300))
+  check('非斜杠文本原样发模型',
+    followupCalls.length === before + 1 && followupCalls[followupCalls.length - 1].content?.[0]?.text === '普通文本消息',
+    JSON.stringify(followupCalls[followupCalls.length - 1]?.content?.[0]?.text))
+}
+
+// ---- 斜杠命令投影：command/run → running 行；command/done → done 行（补命令名 + 结果）----
+{
+  phone.msgs.length = 0
+  const evListenerCmd = listeners.get('session/event')
+  if (evListenerCmd) {
+    evListenerCmd(mockSession, { seq: 60, time: Date.now(), type: 'command/run', data: { commandId: 'cmd-proj-1', name: 'compact', args: '' } })
+    const run = await awaitMsg(phone.msgs, (m) => m.type === 'event' && m.event?.type === 'command' && m.event.commandStatus === 'running', 'command/run 投影')
+    check('command/run → running 行（命令名+参数）',
+      run?.event?.commandId === 'cmd-proj-1' && run?.event?.commandName === 'compact' && run?.event?.commandArgs === '',
+      JSON.stringify(run?.event))
+
+    evListenerCmd(mockSession, { seq: 61, time: Date.now(), type: 'command/done', data: { commandId: 'cmd-proj-1', kind: 'success', text: 'Compacted 12 history items' } })
+    const done = await awaitMsg(phone.msgs, (m) => m.type === 'event' && m.event?.type === 'command' && m.event.commandStatus === 'done', 'command/done 投影')
+    check('command/done → done 行（补命令名 + 结果文本）',
+      done?.event?.commandId === 'cmd-proj-1' && done?.event?.commandName === 'compact'
+      && done?.event?.commandOk === true && done?.event?.text === 'Compacted 12 history items',
+      JSON.stringify(done?.event))
+  }
+}
+
 // ---- 排队消息：subscribe 带 queue + spliced 广播 + 插队/删除 ----
 {
   phone.ws.send(JSON.stringify({ type: 'subscribe', sessionId: 'session-1' }))
@@ -353,6 +424,22 @@ check('未分组会话 workspaceId=null', hello?.sessions?.find((s) => s.id === 
   check('subscribe 返回排队消息', Array.isArray(hist.queue) && hist.queue.length === 2 && hist.queue[0].placement === 'queued' && hist.queue[0].text === '排队的消息1', JSON.stringify(hist.queue))
   check('subscribe 带该会话 goal（活会话 GoalView）', hist.goal?.objective === '完成 LSP 与调试器集成' && hist.goal?.phase === 'active' && hist.goal?.maxGoalRounds === 8 && hist.goal?.roundsStarted === 1, JSON.stringify(hist.goal))
   check('subscribe 带该会话 todos（任务列表投影）', Array.isArray(hist.todos) && hist.todos.length === 2 && hist.todos[0].content === '写协议字段' && hist.todos[0].status === 'in_progress', JSON.stringify(hist.todos))
+  // 斜杠命令清单（服务端注册表权威，客户端 "/" 候选弹窗数据源）
+  check('subscribe 带斜杠命令清单（名称+说明+参数提示）',
+    Array.isArray(hist.commands) && hist.commands.length === 2
+    && hist.commands[0].name === 'compact' && hist.commands[0].description === 'Compact older conversation history'
+    && hist.commands[1].name === 'plan' && hist.commands[1].input?.hint === 'off|message',
+    JSON.stringify(hist.commands))
+  // commands/change → commands_update 广播（重读清单推给手机）
+  const changeListener = eventsListeners.get('commands/change')
+  if (changeListener) {
+    phone.msgs.length = 0
+    changeListener()
+    const cu = await awaitMsg(phone.msgs, (m) => m.type === 'commands_update' && m.sessionId === 'session-1', 'commands_update 广播')
+    check('commands/change → commands_update 广播（重读命令清单）',
+      Array.isArray(cu.commands) && cu.commands.length === 2 && cu.commands[0].name === 'compact',
+      JSON.stringify(cu.commands))
+  }
   // todo/write 事件 → todos_update 广播（会话级）
   phone.msgs.length = 0
   const evListenerTodo = listeners.get('session/event')
@@ -613,7 +700,7 @@ const approvalListener = listeners.get('approval/request')
 {
   const phone3 = await openPhone()
   const boot = await awaitMsg(phone3.msgs, (m) => m.type === 'server_boot', 'server_boot 推送')
-  check('重连客户端收到 server_boot（版本 + notes）', boot.version === '0.11.9' && Array.isArray(boot.notes), JSON.stringify(boot))
+  check('重连客户端收到 server_boot（版本 + notes）', boot.version === '0.11.10' && Array.isArray(boot.notes), JSON.stringify(boot))
   phone3.ws.close()
 }
 
