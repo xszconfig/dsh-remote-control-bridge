@@ -410,8 +410,39 @@ export function apply(ctx: Context) {
       .map((t) => ({ content: t.content, status: typeof t.status === 'string' ? t.status : 'pending' }))
   }
 
+  /**
+   * 从投影快照 values 提取子代理 identity 的 label（创建该子代理时 tool/call 的 description）。
+   * dsh-subagent 的 `subagent` 投影把 child 自身日志里的 `subagent/descriptor` 事件折成
+   * `{ mode, label, seq }`，其中 label 正是主 agent 派发时写的 5~10 字凝练描述。
+   */
+  const subagentLabelFromValues = (values: Record<string, unknown> | undefined): string | undefined => {
+    const identity = values?.['subagent'] as { label?: unknown } | null | undefined
+    if (identity === null || typeof identity !== 'object') return undefined
+    const label = identity.label
+    if (typeof label !== 'string') return undefined
+    const trimmed = label.replace(/\s+/g, ' ').trim()
+    return trimmed.length > 0 ? trimmed : undefined
+  }
+
+  /** 活子代理会话的 description：读 sessionProjections 快照（软依赖，缺失降级）。 */
+  const subagentLabelOfLive = (s: Session): string | undefined => {
+    try {
+      const proj = ctx.get('sessionProjections') as
+        | { snapshot(s: unknown): { values: Record<string, unknown> } }
+        | undefined
+      return subagentLabelFromValues(proj?.snapshot(s).values)
+    } catch {
+      return undefined
+    }
+  }
+
   /** Desktop display title: durable title, cwd basename, then id. */
   const displayTitleOf = (s: Session): string => {
+    // 子代理会话：标题优先取创建时的 description（subagent 投影 label，高度凝练）
+    if (s.header.parentSession !== undefined) {
+      const label = subagentLabelOfLive(s)
+      if (label) return label
+    }
     const title = ctx.sessionTitle.get(s)?.title
     if (title) return title
     const cwd = s.header.cwd
@@ -480,6 +511,11 @@ export function apply(ctx: Context) {
       const values = snap?.values as Record<string, unknown> | undefined
       const titleVal = values?.['title']
       if (typeof titleVal === 'string' && titleVal.length > 0) title = titleVal
+      // 子代理会话：标题优先取创建时的 description（subagent 投影 label，零日志读取）
+      if (h.parentSession !== undefined) {
+        const subagentLabel = subagentLabelFromValues(values)
+        if (subagentLabel) title = subagentLabel
+      }
       const meta = values?.['sessionListMetadata'] as { blank?: boolean; lastPromptAt?: number | null } | undefined
       if (typeof meta?.lastPromptAt === 'number') lastPromptAt = meta.lastPromptAt
     } catch (e: unknown) {
@@ -967,10 +1003,12 @@ export function apply(ctx: Context) {
   // ---- live event fan-out ----
   ctx.on('session/event', (session, event) => {
     if (event.type === 'session/title') {
+      // 子代理会话：标题用 description（而非 DSH 自动生成的首个 Prompt），避免手机端被覆盖
+      const label = session.header.parentSession !== undefined ? subagentLabelOfLive(session) : undefined
       broadcast({
         type: 'session_title',
         sessionId: String(session.id),
-        title: event.data.title,
+        title: label ?? event.data.title,
       })
       return
     }
