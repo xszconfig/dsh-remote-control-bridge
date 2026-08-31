@@ -19,3 +19,4 @@
 - 调试后端：当前用 **CDP（Node Inspector）直连**，零依赖但仅 Node；`DebugManager` 回调接口已预留 DAP 平替 seam。**未来若扩语言（Python/Go/Rust）必须先问用户**再实施 DAP 后端。
 - 语言服务器：TS/JS/Python/Rust/C/C++ + 官方 JetBrains kotlin-lsp（pull 诊断 + 项目导入）。
 - 自动续跑：持续重试 + 指纹幂等 + work.json sessionId 归属（根治版）。
+- **热插拔（自举，不用官方 HMR）**：官方 `cordis-plugin-hmr` 在 Web profile 被禁用（reload 生命周期未测完），不强行打开。本插件拆为**稳定薄壳**（src/index.ts + src/reloader.ts + src/auth.ts，改动需重启）+ **可热换业务 core**（src/core.ts 及其相对依赖，每次 reload 整体复制进 `~/.dsh/bridge-reload/<ts>/` 版本化目录再动态 import，靠「新目录=新缓存键」全依赖图换新）。触发：fs.watch 部署 lib 目录（`DSH_REMOTE_HOT_RELOAD=0` 关 watcher）或 `POST /remote/reload`；状态看 `GET /remote/hot`。失败回滚到上一代模块。**首次激活需重启一次**（旧进程无 shell），此后业务迭代免重启；升级依赖包仍需重启。见 docs/hot-reload.md。
