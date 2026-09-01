@@ -514,6 +514,27 @@ const hello = phone.msgs.find((m) => m.type === 'hello')
   agentStatus = 'running'
 }
 
+// ---- 回归：防抖窗口内消息被消费后，恢复逻辑不得按陈旧快照重复注入（重复送达根因）----
+{
+  const fs = await import('node:fs')
+  const workFile = (process.env.DSH_HOME ?? (process.env.HOME + '/.dsh')) + '/remote-control-work.json'
+  const statusListener = listeners.get('agent/status')
+  const evListenerQueue = listeners.get('session/event')
+
+  // 1) 磁盘快照残留一条「已消费」的消息（模拟 2s 防抖尚未刷新的陈旧状态）
+  fs.writeFileSync(workFile, JSON.stringify({ activity: null, pending: [], notes: [], queues: { 'session-1': { items: [{ id: 'consumed-race', placement: 'queued', text: '已消费不应恢复的排队消息' }], at: Date.now() } }, updatedAt: Date.now() }))
+
+  // 2) 触发 spliced（live 队列不含该消息）→ scheduleQueueSnapshot 挂起「当前真实队列」的快照写入
+  evListenerQueue(mockSession, { seq: 90, time: Date.now(), type: 'agent/inbox/spliced', data: { target: 'next-turn', start: 0, removedCount: 0, inserted: [] } })
+  await new Promise((r) => setTimeout(r, 0)) // 让 queueMicrotask 里的 scheduleQueueSnapshot 先执行
+
+  // 3) 防抖窗口内触发恢复：修复前按步骤 1 的陈旧快照误判「已消费」为「丢失」→ 重复注入
+  const before = followupCalls.length
+  if (statusListener) statusListener({ agent: mockAgent(), status: 'running' })
+  const dup = followupCalls.slice(before).filter((f) => f.content?.[0]?.text?.includes('已消费不应恢复的排队消息'))
+  check('防抖窗口内被消费的消息不被重复恢复注入（重复送达修复）', dup.length === 0, JSON.stringify({ n: dup.length }))
+}
+
 check('hello 版本（0.12.0/0.13.0 兼容）含三挂起队列', isVersion(hello?.version) && Array.isArray(hello?.pendingApprovals) && Array.isArray(hello?.pendingRemoteApprovals) && Array.isArray(hello?.pendingQuestions), hello?.version)
 
 // ---- 会话列表合并持久化层（冷会话可见 + 标题/工作区/排序）----

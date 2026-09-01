@@ -875,25 +875,41 @@ export function apply(ctx: Context) {
   ]
 
   // ---- 排队消息持久化：变化时快照进 work.json，重启后对比恢复（丢了才重新注入，防重复）----
-  const queueSnapTimers = new Map<string, NodeJS.Timeout>()
+  // 防抖窗口（2000ms）内磁盘快照落后于真实队列：消息刚被消费、快照尚未刷新时，若恢复逻辑
+  // 仍按陈旧快照对比，会把「已消费」误判为「重启丢失」→ 重复送达同一条消息。故恢复前必须先
+  // flush 挂起的写入，让磁盘状态追上真实队列后再对比。
+  const QUEUE_SNAPSHOT_DEBOUNCE_MS = 2000
+  const queueSnapTimers = new Map<string, { timer: NodeJS.Timeout; items: QueueItemWire[] }>()
+  const writeQueueSnapshot = (sessionId: string, items: QueueItemWire[]): void => {
+    try {
+      const work = loadWorkState(WORK_FILE)
+      const queues = { ...(work?.queues ?? {}) }
+      queues[sessionId] = {
+        items: items.map((i) => ({ id: i.id, placement: i.placement, text: i.text })),
+        at: Date.now(),
+      }
+      writeWorkState(WORK_FILE, { queues })
+    } catch (e: unknown) {
+      logger.warn('QUEUE', `队列快照写入失败 session=${sessionId.slice(0, 12)}: ${String(e)}`)
+    }
+  }
+  /** 立即把挂起的（防抖未到期）快照写盘，使磁盘状态追上真实队列；无挂起则不动。 */
+  const flushQueueSnapshot = (sessionId: string): void => {
+    const pending = queueSnapTimers.get(sessionId)
+    if (pending === undefined) return
+    clearTimeout(pending.timer)
+    queueSnapTimers.delete(sessionId)
+    writeQueueSnapshot(sessionId, pending.items)
+  }
   const scheduleQueueSnapshot = (sessionId: string, items: QueueItemWire[]): void => {
     const prev = queueSnapTimers.get(sessionId)
-    if (prev !== undefined) clearTimeout(prev)
-    const t = setTimeout(() => {
+    if (prev !== undefined) clearTimeout(prev.timer)
+    const timer = setTimeout(() => {
       queueSnapTimers.delete(sessionId)
-      try {
-        const work = loadWorkState(WORK_FILE)
-        const queues = { ...(work?.queues ?? {}) }
-        queues[sessionId] = {
-          items: items.map((i) => ({ id: i.id, placement: i.placement, text: i.text })),
-          at: Date.now(),
-        }
-        writeWorkState(WORK_FILE, { queues })
-      } catch (e: unknown) {
-        logger.warn('QUEUE', `队列快照写入失败 session=${sessionId.slice(0, 12)}: ${String(e)}`)
-      }
-    }, 2000)
-    t.unref?.()
+      writeQueueSnapshot(sessionId, items)
+    }, QUEUE_SNAPSHOT_DEBOUNCE_MS)
+    timer.unref?.()
+    queueSnapTimers.set(sessionId, { timer, items })
   }
   /** 重启后恢复：快照里活队列没有的消息（按 id 或文本去重）重新注入；恢复完清掉快照。 */
   // 与 tryResumeIfPending 同款重入防护：followup 会同步唤醒 idle agent → agent/status running →
@@ -901,6 +917,8 @@ export function apply(ctx: Context) {
   const restoringSessions = new Set<string>()
   const restoreQueueIfLost = (sessionId: string): void => {
     if (restoringSessions.has(sessionId)) return
+    // 先 flush 防抖窗口内挂起的快照写入，避免按「已消费、尚未刷新」的陈旧快照误判为丢失而重复注入。
+    flushQueueSnapshot(sessionId)
     try {
       const work = loadWorkState(WORK_FILE)
       const snap = work?.queues?.[sessionId]
@@ -2311,7 +2329,7 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
     lspFeedback.dispose()
     lsp.dispose()
     debug.dispose()
-    for (const t of queueSnapTimers.values()) clearTimeout(t)
+    for (const t of queueSnapTimers.values()) clearTimeout(t.timer)
     queueSnapTimers.clear()
     clearInterval(heartbeat)
     for (const entry of pendingApprovals.values()) {
