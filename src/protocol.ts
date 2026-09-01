@@ -18,6 +18,24 @@ export interface SessionSummary {
   agentCount: number
   subagentCount: number
   updatedAt: number
+  /**
+   * 最后一条消息的时间戳（epoch ms）。与 updatedAt 同源：live 会话 = 末事件时间，
+   * 冷会话 = max(createdAt, lastPromptAt)。单独成字段是为了语义清晰（updatedAt 是排序键），
+   * 当前两者取值相等。
+   */
+  lastMessageAt?: number
+  /**
+   * 总运行时长 = 累计活跃计算时长（模型 wall time + 工具 wall time，毫秒），
+   * 由 dsh-session-stats 的 `sessionStats` 投影折叠完整日志得到（跨重启持久化）；
+   * 不含会话间空闲等待时间。无该投影单元（旧部署/headless）时缺省。
+   */
+  runDurationMs?: number
+  /**
+   * 总消耗 token 量 = provider 上报的累计 usage（uncachedInput + output + cacheRead + cacheWrite），
+   * 由 dsh-token-meter 的 `tokenUsage` 投影折叠完整日志得到（跨重启持久化）。
+   * 无该投影单元（旧部署/headless）时缺省。
+   */
+  totalTokens?: number
   /** 子代理会话所属的主会话 id；缺省 = 顶层（用户手动创建的）会话。 */
   parentSessionId?: string
 }
