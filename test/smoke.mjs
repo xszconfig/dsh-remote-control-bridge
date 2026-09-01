@@ -187,9 +187,14 @@ const mockCtx = {
   },
   sessionTitle: { get: () => undefined },
   // todos 投影 mock（任务列表会话隔离用）+ subagent 投影 mock（子代理标题 description）
+  // + sessionStats / tokenUsage 投影 mock（子代理列表元信息：运行时长 / token，服务端权威）
   sessionProjections: {
     snapshot: (session) => {
-      const values = { todos: [{ content: '写协议字段', status: 'in_progress' }, { content: '跑冒烟', status: 'pending' }] }
+      const values = {
+        todos: [{ content: '写协议字段', status: 'in_progress' }, { content: '跑冒烟', status: 'pending' }],
+        sessionStats: { turns: 2, steps: 3, llmMs: 5000, toolMs: 3000, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
+        tokenUsage: { uncachedInputTokens: 100, outputTokens: 200, cacheReadTokens: 30, cacheWriteTokens: 40 },
+      }
       if (session && String(session.id) === 'session-sub') {
         values.subagent = { mode: 'one-shot', label: 'Deep Diving 计时闪烁修复', seq: 0 }
       }
@@ -249,7 +254,12 @@ const mockCtx = {
       return {
         cachedSnapshot(meta) {
           if (String(meta.id) === 'cold-1') {
-            return { values: { title: '冷会话标题A', sessionListMetadata: { blank: false, lastPromptAt: 2000 } } }
+            return { values: {
+              title: '冷会话标题A',
+              sessionListMetadata: { blank: false, lastPromptAt: 2000 },
+              sessionStats: { turns: 1, steps: 2, llmMs: 1000, toolMs: 500 },
+              tokenUsage: { uncachedInputTokens: 10, outputTokens: 20, cacheReadTokens: 0, cacheWriteTokens: 5 },
+            } }
           }
           if (String(meta.id) === 'cold-sub') {
             return { values: { title: '排查自动续跑失败的根因并修复（很长的首个 Prompt 无法在一行内展示核心信息）', subagent: { mode: 'one-shot', label: '自动续跑根因排查修复', seq: 0 } } }
@@ -526,6 +536,13 @@ check('未分组会话 workspaceId=null', hello?.sessions?.find((s) => s.id === 
 check('子代理会话标题 = 创建时 description（活会话，覆盖首个 Prompt）', hello?.sessions?.find((s) => s.id === 'session-sub')?.name === 'Deep Diving 计时闪烁修复', JSON.stringify(hello?.sessions?.find((s) => s.id === 'session-sub')))
 check('子代理会话标题 = 父会话 tool/call 的 description（冷会话）', hello?.sessions?.find((s) => s.id === 'cold-sub')?.name === '自动续跑根因排查修复', JSON.stringify(hello?.sessions?.find((s) => s.id === 'cold-sub')))
 check('无 description 的子代理会话回退原投影标题', hello?.sessions?.find((s) => s.id === 'cold-sub-nodesc')?.name === '回退原标题测试', JSON.stringify(hello?.sessions?.find((s) => s.id === 'cold-sub-nodesc')))
+
+// ---- 子代理列表元信息：最后消息时间 / 总运行时长 / 总 token（服务端投影，兼容缺省）----
+check('活会话 lastMessageAt = updatedAt（末事件时间）', hello?.sessions?.find((s) => s.id === 'session-1')?.lastMessageAt === 1400 && hello?.sessions?.find((s) => s.id === 'session-1')?.lastMessageAt === hello?.sessions?.find((s) => s.id === 'session-1')?.updatedAt, JSON.stringify(hello?.sessions?.find((s) => s.id === 'session-1')))
+check('活会话 runDurationMs = sessionStats.llmMs + toolMs', hello?.sessions?.find((s) => s.id === 'session-1')?.runDurationMs === 8000, JSON.stringify(hello?.sessions?.find((s) => s.id === 'session-1')))
+check('活会话 totalTokens = tokenUsage 四桶之和', hello?.sessions?.find((s) => s.id === 'session-1')?.totalTokens === 370, JSON.stringify(hello?.sessions?.find((s) => s.id === 'session-1')))
+check('冷会话 runDurationMs / totalTokens 来自投影缓存', hello?.sessions?.find((s) => s.id === 'cold-1')?.runDurationMs === 1500 && hello?.sessions?.find((s) => s.id === 'cold-1')?.totalTokens === 35, JSON.stringify(hello?.sessions?.find((s) => s.id === 'cold-1')))
+check('无投影缓存元信息的冷会话：runDurationMs/totalTokens 缺省，lastMessageAt 仍回退 createdAt', (() => { const c = hello?.sessions?.find((s) => s.id === 'cold-2'); return c?.runDurationMs === undefined && c?.totalTokens === undefined && c?.lastMessageAt === 3000 })())
 
 // ---- 子代理会话标题：session/title 推送也用 description（覆盖 DSH 首个 Prompt）----
 {
