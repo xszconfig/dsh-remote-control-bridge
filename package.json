@@ -42,7 +42,7 @@
     "build": "tsc -p tsconfig.json && pnpm build:client",
     "build:client": "node scripts/build-client.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node test/hotreload.test.mjs && node test/smoke.mjs"
+    "test": "node test/hotreload.test.mjs && node test/contract-check.mjs && node test/smoke.mjs"
   },
   "dependencies": {
     "qrcode": "^1.5.4",

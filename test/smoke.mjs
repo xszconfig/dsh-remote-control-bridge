@@ -388,6 +388,30 @@ check('bridge 已连接 mux WebSocket', muxReady)
   check('/remote/hot ok + reloads>=0 + shell 字符串', j.ok === true && Number.isInteger(j.reloads) && j.reloads >= 0 && typeof j.shell === 'string', JSON.stringify(j))
 }
 
+// ---- WS 鉴权对齐 REST（S1 修复）：无 env token 时，匿名 open 路径必须同时满足
+// 来源 IP 回环 + Host 头回环。伪造「隧道化远程流量」（remoteAddress=127.0.0.1 但 Host
+// 非回环，模拟 Tailscale serve / SSH -L 转发）的 upgrade 请求，断言被 401 拒绝。
+{
+  const upgradeHandler = upgrades.get('/remote/ws')
+  const run = (host, remoteAddress) => {
+    const written = []
+    const destroyed = { v: false }
+    const req = { url: '/remote/ws', headers: { host }, socket: { remoteAddress } }
+    const socket = {
+      write(s) { written.push(s) },
+      destroy() { destroyed.v = true },
+    }
+    upgradeHandler(req, socket, Buffer.alloc(0))
+    return { written, destroyed }
+  }
+  // 非回环 Host + 回环 remoteAddress（隧道化远程流量）→ 拒绝
+  const a = run('100.64.0.1:3080', '127.0.0.1')
+  check('WS 匿名 open：非回环 Host 被 401 拒绝', a.written.some((s) => s.includes('401')) && a.destroyed.v === true, JSON.stringify(a.written))
+  // 回环 Host + 非回环 remoteAddress（来源非本机）→ 拒绝
+  const b = run('127.0.0.1:3080', '10.0.0.5')
+  check('WS 匿名 open：非回环来源被 401 拒绝', b.written.some((s) => s.includes('401')) && b.destroyed.v === true, JSON.stringify(b.written))
+}
+
 // 手机客户端
 const openPhone = () => new Promise((resolve, reject) => {
   const ws = new WebSocket(`ws://127.0.0.1:${port}/remote/ws`)

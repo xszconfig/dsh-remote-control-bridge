@@ -108,8 +108,8 @@ DeepSeek Harness 桌面端远程控制桥接插件（当前版本 **0.10.9**）�
 
 ## 认证
 
-- 默认无 token（信任 dsh web server 的 loopback 绑定）。
-- 设 `DSH_REMOTE_TOKEN` 后，客户端需在 `?token=` 或 `Authorization: Bearer` 提供。
+- 默认无 token 时，匿名连接（无任何凭证）**仅接受「来源 IP 回环 + Host 头回环」的请求**——与 REST 路由的 `allowLocalOrEnvToken` 同语义。这保证 Tailscale serve / SSH 隧道把远程流量转发到 `127.0.0.1` 时（来源 IP 已是回环、但 Host 头非回环）不会被匿名放行。
+- 设 `DSH_REMOTE_TOKEN` 后，客户端需在 `?token=` 或 `Authorization: Bearer` 提供；带有效 env/pair/device token 的连接不受回环限制（手机经 Tailscale IP 直连 + device token 照常工作）。
 - `?pair=` 一次性配对 token 与 `?token=` 设备长期 token 也受支持；`/remote/ping` 无需认证（供在线探测）。
 
 ## 安装到 dsh web profile
