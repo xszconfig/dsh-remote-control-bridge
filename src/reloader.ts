@@ -13,6 +13,7 @@
 import {
   copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   readdirSync,
   rmSync,
@@ -62,25 +63,47 @@ function versionOf(mod: unknown): string | null {
   return typeof v === 'string' ? v : null
 }
 
-/** 从 from 起向上找最近的 node_modules（供 staging 目录链接 bare import 用）。 */
-function findNodeModules(from: string): string | null {
+/**
+ * 从 from 起向上收集**每一个**祖先 node_modules（最近优先）。
+ *
+ * 为什么必须收集全部而不是最近的第一个：pnpm 把依赖分层存放——近层
+ * （`~/.dsh/profiles/web/node_modules`）只有 qrcode/ws 等，远层
+ * （`~/.dsh/profiles/node_modules`）才有 @deepseek-ai/* 运行时包。若只链最近的，
+ * staging 目录里的 `import '@deepseek-ai/cordis'` 会解析失败（ERR_MODULE_NOT_FOUND），
+ * 导致首次激活 core 加载失败。合并所有层才能让「staging 目录外的 import」解析等价于
+ * 「部署包原位」的解析（Node 逐层向上检查每个祖先 node_modules）。
+ */
+function collectNodeModules(from: string): string[] {
+  const found: string[] = []
   let dir = from
   while (true) {
     const nm = join(dir, 'node_modules')
-    if (existsSync(nm)) return nm
+    if (existsSync(nm)) found.push(nm)
     const parent = dirname(dir)
-    if (parent === dir) return null
+    if (parent === dir) return found
     dir = parent
+  }
+}
+
+/** 判断 p 处是否已存在任意条目（不跟随符号链接，悬空链接也算已存在）。 */
+function entryExists(p: string): boolean {
+  try {
+    lstatSync(p)
+    return true
+  } catch {
+    return false
   }
 }
 
 /**
  * 默认复制实现：把 libDir 里的全部 *.js 平铺复制进 destDir。
  * 关键：staging 目录位于部署包目录树之外，core.js 的 bare import（ws / qrcode /
- * @deepseek-ai/*）不会沿 staging 向上解析到部署包的 node_modules，故额外在
- * destDir 内建一个 node_modules 符号链接指向部署包最近的 node_modules——相对依赖
- * （./x.js）随目录热换，bare 依赖保持固定共享。找不到 node_modules 时静默跳过
- * （测试 fixture 的 core.js 无 bare import）。
+ * @deepseek-ai/*）不会沿 staging 向上解析到部署包的 node_modules。因此把**所有**
+ * 祖先 node_modules 的顶层条目合并式 symlink 进 destDir/node_modules（真实目录）：
+ * 按最近→最远遍历，同名条目先到先得、后到的跳过——近层优先，与 Node 从导入文件向上
+ * 逐层检查 node_modules 的「最近命中」语义一致。相对依赖（./x.js）随目录热换，bare
+ * 依赖保持固定共享。找不到任何 node_modules 时静默跳过（测试 fixture 的 core.js
+ * 无 bare import）。单个 symlink 失败（EEXIST/EPERM/平台不支持）只跳过该条目，不中断复制。
  */
 async function defaultCopyFiles(srcDir: string, destDir: string): Promise<void> {
   mkdirSync(destDir, { recursive: true })
@@ -88,12 +111,31 @@ async function defaultCopyFiles(srcDir: string, destDir: string): Promise<void> 
     if (!name.endsWith('.js')) continue
     copyFileSync(join(srcDir, name), join(destDir, name))
   }
-  const nm = findNodeModules(dirname(srcDir))
-  if (nm !== null) {
+
+  const nms = collectNodeModules(dirname(srcDir))
+  if (nms.length === 0) return
+
+  const nmDest = join(destDir, 'node_modules')
+  try {
+    mkdirSync(nmDest, { recursive: true })
+  } catch {
+    return // 建目录失败（权限等）：放弃链接，不中断复制
+  }
+  for (const nm of nms) {
+    let names: string[]
     try {
-      symlinkSync(nm, join(destDir, 'node_modules'), 'dir')
+      names = readdirSync(nm)
     } catch {
-      // 已存在或平台不支持符号链接：忽略，等下一次 reload 重试
+      continue
+    }
+    for (const entry of names) {
+      const linkPath = join(nmDest, entry)
+      if (entryExists(linkPath)) continue // 同名已存在：近层优先，跳过远层同名条目
+      try {
+        symlinkSync(join(nm, entry), linkPath, 'dir')
+      } catch {
+        // EEXIST / EPERM / 平台不支持符号链接：跳过该条目，不中断复制
+      }
     }
   }
 }

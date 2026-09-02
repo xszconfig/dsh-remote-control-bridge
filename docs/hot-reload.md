@@ -23,7 +23,7 @@ DSH 以 Cordis 插件方式加载本包（profile bundles 里的 `dsh-remote-con
   core  lib/core.ts（业务整体，随版本目录热换）
    ├─ name = 'dsh-remote-control-bridge-core'；inject/apply 与原 index.ts 完全一致
    ├─ 相对依赖 ./protocol.js、./lsp.js、./lsp-feedback.js、./debug.js、./work.js、./logger.js、./auth.js
-   └─ bare 依赖 ws / qrcode / @deepseek-ai/*（经 staging 目录内的 node_modules 符号链接解析）
+   └─ bare 依赖 ws / qrcode / @deepseek-ai/*（经 staging/node_modules 合并式符号链接解析）
 
 磁盘
   ~/.dsh/bridge-reload/
@@ -39,8 +39,20 @@ DSH 以 Cordis 插件方式加载本包（profile bundles 里的 `dsh-remote-con
 
 **bare import 怎么办**：`ws` / `qrcode` / `@deepseek-ai/*` 按「从导入文件所在目录向上找
 `node_modules`」解析，而暂存目录位于部署包目录树之外，向上找不到。所以复制时额外在暂存目录内
-建一个 `node_modules` 符号链接，指向部署包向上最近的 `node_modules`（`ReloadController` 的
-默认 `copyFiles` 实现完成，见 `src/reloader.ts`）。相对依赖随目录热换，bare 依赖保持固定共享。
+建一个**真实目录** `node_modules`，把**所有**祖先 `node_modules` 的顶层条目合并式符号链接进来
+（`ReloadController` 的默认 `copyFiles` 实现完成，见 `src/reloader.ts`）：从 srcDir 向上收集
+每一个祖先 `node_modules`（直到文件系统根），按最近→最远遍历，同名条目先到先得、后到的跳过
+（近层优先，与 Node 逐层向上解析的「最近命中」语义一致）；单个符号链接失败只跳过该条目。
+相对依赖随目录热换，bare 依赖保持固定共享。
+
+> **为什么必须合并而不是单目标链接**：pnpm 把依赖分层存放——近层
+> （`~/.dsh/profiles/web/node_modules`）只有 qrcode/ws 等，远层
+> （`~/.dsh/profiles/node_modules`）才有 @deepseek-ai/* 运行时包。若只链最近的一层，
+> `import '@deepseek-ai/cordis'` 会解析失败（ERR_MODULE_NOT_FOUND）。合并所有层才能让
+> 「staging 目录外的 import」解析等价于「部署包原位」的解析。
+
+> **生产实锤（0.13.0）**：0.13.0 首次激活时因上述单目标链接缺陷，`@deepseek-ai/*` 解析失败、
+> core 加载失败；临时用环境补丁（额外把远层 @deepseek-ai 链接进近层）恢复；本合并式修复为根治版。
 
 ## 部署流
 
