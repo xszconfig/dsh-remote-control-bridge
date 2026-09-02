@@ -48,9 +48,25 @@ export interface AgentSummary {
     depth: number;
 }
 export type EventKind = 'user_message' | 'assistant_message' | 'tool_call' | 'tool_result' | 'think' | 'command' | 'error' | 'system';
+/**
+ * 消息来源分类（仅 `user_message` 行承载，其它行类型无需该字段）。
+ * 铁律 6：分类必须在桥侧完成（按 DSH 会话日志节点的权威元数据判定），客户端只渲染。
+ *
+ * - `'user'`：真实用户输入（DSH `UserMessage.source.kind === 'user'`）。
+ * - `'inject'`：注入的上下文/系统消息（agent.inject()/plugin/steer/压缩检查点/
+ *   session 起始提醒等，即 DSH `UserMessage.source.kind !== 'user'`，典型为
+ *   `kind: 'plugin'` 的 AGENTS.md `<system-reminder>`、LSP 编译错误反馈、
+ *   文件变更通知、cron、技能内容、目标续跑轮次等；含未知/缺失 source 的降级）。
+ *
+ * 缺省 = 旧桥（无该字段），老 App 按 `ignoreUnknownKeys` 忽略，老 App 端 `null`
+ * 视作 user 以向后兼容。
+ */
+export type EventSource = 'user' | 'inject';
 export interface EventProjection {
     seq: number;
     type: EventKind;
+    /** 消息来源分类（见 {@link EventSource}）。仅 user_message 行必有；其它行可省略。 */
+    source?: EventSource;
     text?: string;
     toolName?: string;
     toolArgs?: string;

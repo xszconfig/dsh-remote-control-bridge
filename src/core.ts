@@ -31,7 +31,7 @@ import {
   type CommandWire,
   type DeviceRecord,
   type DiffWire,
-  type EventProjection,  type EvHello,
+  type EventProjection,  type EventSource,  type EvHello,
   type GoalWire,
   type LogEntryWire,
   type PairInfo,
@@ -2648,7 +2648,18 @@ function projectEvent(ctx: Context, event: SessionEvent, scope?: unknown): Event
     case 'user/message': {
       const text = extractText(event.data.content)
       if (!text) return []
-      return [{ ...base, type: 'user_message', text }]
+      // 权威分类（铁律 6：以服务端投影为准，分类在桥侧完成，客户端只渲染）：
+      // DSH `user/message` 节点携带的 `source.kind` 是唯一权威判别元数据——
+      //   - kind === 'user'        → 真实用户输入（排队消息被本轮认领）。
+      //   - kind === 'plugin'/其它  → 注入的上下文/系统消息（agent.inject() 的
+      //     AGENTS.md <system-reminder>、LSP 编译错误反馈、文件变更通知、cron、
+      //     技能内容、压缩检查点、session 起始提醒、目标续跑轮次等），source.form
+      //     可细分 instructions/catalog/snapshot/notice/relay/recall，但都不得落回 user。
+      // `MessageSource` 是 merge-extensible sum type：任何未知/缺失的 source 都按
+      // 注入处理（与 Web 端 contextProvenance 的降级语义一致），绝不误判为用户。
+      const src = (event.data.source as { kind?: unknown } | undefined)?.kind
+      const source: EventSource = src === 'user' ? 'user' : 'inject'
+      return [{ ...base, type: 'user_message', text, source }]
     }
     case 'assistant/message': {
       // Think（reasoning）步骤单独投影为一行，与桌面端一致；正文照常
