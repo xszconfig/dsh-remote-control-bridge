@@ -43,7 +43,7 @@ import {
   type WorkspaceSummary,
 } from './protocol.js'
 import { ConnLogger } from './logger.js'
-import { allowLocalOrEnvToken, bearerToken, denied, isLoopback, json } from './auth.js'
+import { allowLocalOrEnvToken, bearerToken, denied, isLoopback, isLoopbackHostHeader, json } from './auth.js'
 
 // core 版本号对外暴露（ReloadController 读取 mod.BRIDGE_VERSION 作为 /remote/hot 的 coreVersion）
 export { BRIDGE_VERSION } from './protocol.js'
@@ -1605,7 +1605,10 @@ export function apply(ctx: Context) {
     if (envToken) {
       if (candidates.includes(envToken)) return { kind: 'env' }
     } else if (candidates.length === 0) {
-      return { kind: 'open' }
+      // 无 token 的 open 路径必须同时满足「来源 IP 回环 + Host 头回环」，与 REST 的
+      // allowLocalOrEnvToken 同语义。否则 Tailscale serve / SSH -L 把远程流量转发到
+      // 127.0.0.1 时（remoteAddress 已变成回环），仍会被匿名放行——这是 S1 鉴权缺口。
+      return isLoopback(req) && isLoopbackHostHeader(req) ? { kind: 'open' } : { kind: 'none' }
     }
 
     for (const c of candidates) {
