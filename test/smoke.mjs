@@ -569,6 +569,37 @@ const hello = phone.msgs.find((m) => m.type === 'hello')
   check('防抖窗口内被消费的消息不被重复恢复注入（重复送达修复）', dup.length === 0, JSON.stringify({ n: dup.length }))
 }
 
+// ---- 回归：框架注入消息（子代理收尾/报告/LSP 反馈）不入队列快照，杜绝被当用户消息重复恢复注入 ----
+{
+  const fs = await import('node:fs')
+  const workFile = (process.env.DSH_HOME ?? (process.env.HOME + '/.dsh')) + '/remote-control-work.json'
+  const evListenerQueue = listeners.get('session/event')
+
+  // 隔离现场：清空 live 队列与磁盘快照，只放一条子代理收尾通知到 nextStep
+  const savedTurn = inbox.nextTurn.slice()
+  const savedStep = inbox.nextStep.slice()
+  inbox.nextTurn.length = 0
+  inbox.nextStep.length = 0
+  inbox.nextStep.push({ id: 'sub-settled-x', source: { kind: 'subagent-settled' }, content: [{ type: 'text', text: '设计方案已完成并通过 report 回传给父代理' }] })
+  fs.writeFileSync(workFile, JSON.stringify({ activity: null, pending: [], notes: [], queues: {}, updatedAt: Date.now() }))
+
+  // 触发 spliced（收尾通知入 nextStep）→ 挂起快照写入（应过滤掉框架消息）
+  evListenerQueue(mockSession, { seq: 93, time: Date.now(), type: 'agent/inbox/spliced', data: { target: 'next-step', start: 0, removedCount: 0, inserted: [{ id: 'sub-settled-x', source: { kind: 'subagent-settled' }, content: [{ type: 'text', text: '设计方案已完成并通过 report 回传给父代理' }] }] } })
+  await new Promise((r) => setTimeout(r, 0)) // 让 queueMicrotask 里的 scheduleQueueSnapshot 先执行
+  await new Promise((r) => setTimeout(r, 2200)) // 等 2s 防抖落盘
+
+  const workNow = JSON.parse(fs.readFileSync(workFile, 'utf8'))
+  const snapItems = workNow.queues?.['session-1']?.items ?? []
+  const leaked = snapItems.some((i) => i.id === 'sub-settled-x' || (i.text ?? '').includes('设计方案已完成'))
+  check('子代理收尾通知不入队列快照（防重复恢复注入根因）', !leaked, JSON.stringify(snapItems))
+
+  // 还原现场（后续排队消息用例依赖 m1/m2）
+  inbox.nextTurn.length = 0
+  inbox.nextStep.length = 0
+  inbox.nextTurn.push(...savedTurn)
+  inbox.nextStep.push(...savedStep)
+}
+
 check('hello 版本（0.12.0/0.13.0 兼容）含三挂起队列', isVersion(hello?.version) && Array.isArray(hello?.pendingApprovals) && Array.isArray(hello?.pendingRemoteApprovals) && Array.isArray(hello?.pendingQuestions), hello?.version)
 
 // ---- 会话列表合并持久化层（冷会话可见 + 标题/工作区/排序）----
