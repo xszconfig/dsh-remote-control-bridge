@@ -8,7 +8,7 @@
 | 仓库/模块 | 桥（`src/core.ts` 排队消息持久化 + 恢复巡检 `restoreQueueIfLost`） |
 | 发现方式 | 用户报告（主对话观察到「同一段内容消息重复出现，回复多次『（重复送达，已忽略）』」） |
 | 日期 | 2026-09-04 |
-| 相关 commit | `<待回填>`（工作树 main，未提交） |
+| 相关 commit | `970b477`（main，已热换部署） |
 | 关联文档 | `docs/bugs/2026-09-02-queue-snapshot-debounce-race.md`（同源前置修复 `cc35dc8`）；`docs/bugs/message-source-classification.md` |
 
 ## 背景
@@ -102,7 +102,7 @@
 +    scheduleQueueSnapshot(String(session.id), userQueueItemsOf(agent))
 ```
 
-- 提交哈希：`<待回填>`（工作树 main，主对话验收后提交）。
+- 提交哈希：`970b477`（main，已热换部署）。
 
 - 回归测试（`test/smoke.mjs`）：新增断言「子代理收尾通知不入队列快照（防重复恢复注入根因）」——把一条 `source.kind="subagent-settled"` 的收尾消息塞进 live inbox 的 `nextStep`，触发 `agent/inbox/spliced`，等 2s 防抖落盘后断言 `work.json` 的该会话快照**不含**该收尾消息（修复前会以 `placement='context'` 写入）。
 
