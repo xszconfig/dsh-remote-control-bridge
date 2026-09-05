@@ -120,6 +120,7 @@ function saveDevices(devices: StoredDevice[]): void {
   }
 }
 
+// eslint-disable-next-line max-lines-per-function -- P0 存量豁免（apply 为启动装配超大函数，TODO 拆分），见 docs/lint-rules.md
 export function apply(ctx: Context) {
   // Token: reuse DSH_REMOTE_TOKEN, otherwise generate one and surface it once.
   const envToken = process.env.DSH_REMOTE_TOKEN ?? ''
@@ -1679,6 +1680,7 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
   return s
 }
 
+  // eslint-disable-next-line max-lines-per-function, complexity -- P0 存量豁免（命令分派超大函数，TODO 拆分），见 docs/lint-rules.md
   const handleCommand = async (ws: WebSocket, raw: Buffer): Promise<void> => {
     let cmd: ClientCommand
     try {
@@ -2639,6 +2641,7 @@ function projectWindowBack(
   return { events, hasMore: events.length >= limit && idx >= 0 }
 }
 
+// eslint-disable-next-line complexity -- P0 存量豁免（事件投影分派圈复杂度高，TODO 拆分），见 docs/lint-rules.md
 function projectEvent(ctx: Context, event: SessionEvent, scope?: unknown): EventProjection[] {
   const base = { seq: event.seq, timestamp: event.time }
   // command/run 与 command/done 不在 dsh-session 的闭包联合类型里（commands 服务直接

@@ -42,6 +42,8 @@
     "build": "tsc -p tsconfig.json && pnpm build:client",
     "build:client": "node scripts/build-client.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint \"src/**/*.ts\" \"client/**/*.{ts,tsx}\" \"test/**/*.mjs\" \"scripts/**/*.mjs\"",
+    "lint:p0": "eslint --config eslint.config.p0.mjs \"src/**/*.ts\" \"client/**/*.{ts,tsx}\" \"test/**/*.mjs\" \"scripts/**/*.mjs\"",
     "test": "node test/hotreload.test.mjs && node test/contract-check.mjs && node test/smoke.mjs"
   },
   "dependencies": {
@@ -73,12 +75,16 @@
     "@deepseek-ai/dsh-tools": "0.1.0-rc.6",
     "@deepseek-ai/dsh-user-approval": "0.1.0-rc.6",
     "@deepseek-ai/dsh-workspace": "0.1.0-rc.6",
+    "@eslint/js": "^10.0.1",
     "@types/node": "^22.10.0",
     "@types/qrcode": "^1.5.6",
     "@types/react": "^18.3.0",
     "@types/ws": "^8.5.13",
     "esbuild": "^0.24.0",
+    "eslint": "^10.9.1",
+    "globals": "^17.12.0",
     "qrcode-generator": "^1.4.4",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "typescript-eslint": "^8.69.0"
   }
 }

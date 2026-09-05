@@ -22,3 +22,32 @@
 - 语言服务器：TS/JS/Python/Rust/C/C++ + 官方 JetBrains kotlin-lsp（pull 诊断 + 项目导入）。
 - 自动续跑：持续重试 + 指纹幂等 + work.json sessionId 归属（根治版）。
 - **热插拔（自举，不用官方 HMR）**：官方 `cordis-plugin-hmr` 在 Web profile 被禁用（reload 生命周期未测完），不强行打开。本插件拆为**稳定薄壳**（src/index.ts + src/reloader.ts + src/auth.ts，改动需重启）+ **可热换业务 core**（src/core.ts 及其相对依赖，每次 reload 整体复制进 `~/.dsh/bridge-reload/<ts>/` 版本化目录再动态 import，靠「新目录=新缓存键」全依赖图换新）。触发：fs.watch 部署 lib 目录（`DSH_REMOTE_HOT_RELOAD=0` 关 watcher）或 `POST /remote/reload`；状态看 `GET /remote/hot`。失败回滚到上一代模块。**首次激活需重启一次**（旧进程无 shell），此后业务迭代免重启；升级依赖包仍需重启。见 docs/hot-reload.md。
+
+## 代码质量闸门（lint）
+
+**强制流程：每次代码变更完成 → lint P0 → 清零 → commit；pre-commit hook 兜底拦截。**
+
+### 工具与用法
+- TS lint 用 **ESLint**（flat config）+ **typescript-eslint**（`recommended`）。
+  - 全量：`pnpm lint`（或 `scripts/lint.sh`）
+  - P0 闸门：`pnpm lint:p0`（或 `scripts/lint.sh p0`）
+- 配置：`eslint.config.mjs`（全量）、`eslint.config.p0.mjs`（P0 子集）。
+
+### P0 定义（高风险规则，命中必须清零才允许 commit）
+- `max-lines-per-function`（超大函数，阈值 200 行）
+- `max-params`（超长参数列表，阈值 8）
+- `complexity`（圈复杂度，阈值 30，近似「类/模块过大」在 JS/TS 侧的高风险信号）
+
+### 强制流程
+1. 代码变更完成后、commit 前，必跑 P0：`scripts/lint.sh p0`（agent 亦可用 `code-lint` skill 一键跑）。
+2. P0 命中 → **必须先修复清零**，才允许 commit。
+3. pre-commit hook 兜底：`git commit` 时自动跑 P0 闸门，未清零直接拦截。
+   - 仅极特殊场景允许 `git commit --no-verify` 跳过（须在 commit message 说明原因）。
+4. 全量 `pnpm lint` 为建议项（存量风格告警不阻塞），但新增代码应尽量不引入新告警。
+
+### 规则积累
+- 新增/收紧规则与动机登记在 `docs/lint-rules.md`；阈值只收紧不放宽。
+- 存量豁免集中在 `src/core.ts`（3 处 `eslint-disable-next-line`，均标注 TODO 拆分），收紧路径：拆分后删豁免 → 阈值 200→80、30→20、8→4。
+
+### 安装 hook（首次 / 重新 clone 后）
+- 运行 `scripts/install-hooks.sh`（把 `hooks/pre-commit` 装进 `.git/hooks/`）。
