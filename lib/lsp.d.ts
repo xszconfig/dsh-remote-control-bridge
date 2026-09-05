@@ -57,10 +57,16 @@ export declare class LspManager {
     /**
      * Agent 主动查询语言服务器（OMP 同款能力）：diagnostics / hover / definition / references。
      * 返回给模型看的纯文本；诊断优先读缓存（push/pull 两个通道都会更新）。
+     *
+     * 内部 deadline：LSP 服务器可能「活着但无响应」的假死（IntelliJ 进程退出前不落 exit 事件、
+     * 或 initialize 后 handler 卡死），因此查询前先做死进程快速失败，再用 withTimeout 兜底 10s，
+     * 绝不无限挂起（生产事故：lsp_query 对已退出的 Kotlin 服务器 await 卡死 agent 回合 400+ 分钟）。
      */
     query(action: 'diagnostics' | 'hover' | 'definition' | 'references', path: string, line?: number, column?: number): Promise<{
         text: string;
     }>;
+    /** query 的 deadline 内主体：初始化等待 + 具体查询（在 query() 里被 10s 兜底，绝不无限挂起）。 */
+    private queryInner;
     private cmdFor;
     /**
      * 官方 JetBrains Kotlin LSP 二进制三级解析：
@@ -93,6 +99,13 @@ export declare class LspManager {
     private findExecutable;
     private ensureServer;
     private killServer;
+    /** 进程是否已死/被杀/未存活（含 exit 事件尚未触发、仅 exitCode 已置位的窗口期）。 */
+    private serverDead;
+    /**
+     * 拒绝所有在途 LSP 请求。根因修复：旧实现只 `pending.clear()`，导致这些 Promise
+     * 永不落定、await 方无限挂起（lsp_query 对已退出的 Kotlin 服务器卡死 agent 回合 400+ 分钟）。
+     */
+    private rejectPending;
     private notify;
     private request;
     private handleMessage;

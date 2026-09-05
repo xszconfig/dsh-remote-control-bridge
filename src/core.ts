@@ -20,6 +20,7 @@ import { LspManager } from './lsp.js'
 import { LspFeedback, lspFeedbackEnabledFromEnv } from './lsp-feedback.js'
 import { DebugManager, type DebugBreakpointWire } from './debug.js'
 import { loadWorkState, writeWorkState, type QueueSnapshotItem } from './work.js'
+import { withTimeout } from './deadline.js'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 
 import {
@@ -754,6 +755,9 @@ export function apply(ctx: Context) {
     ctx.tools.register(defineTool({
       name: 'lsp_query',
       description: '查询语言服务器（代码智能）：某文件的诊断、符号类型与文档（hover）、定义位置、引用位置。诊断需要文件曾被 Agent 编辑/写入过（语言服务器才会分析它）。',
+      // 声明 10s 协作式超时预算：dsh-tool-call-timeout-policy 据此在超时后中止调用（不再无限挂起）。
+      // 内部另有 LspManager.query 的 deadline 双保险（见 src/lsp.ts）。
+      timeoutMs: 10_000,
       parameters: {
         action: {
           type: 'string',
@@ -801,6 +805,7 @@ export function apply(ctx: Context) {
     ctx.tools.register(defineTool({
       name: 'debug_start',
       description: '启动受控调试会话（Node Inspector）：运行指定脚本并挂断点。断点命中的暂停现场（调用栈/作用域）经 WS 推送到手机调试面板；Agent 可用 debug_command 继续/单步/读变量。',
+      timeoutMs: 10_000,
       parameters: {
         sessionId: { type: 'string', required: true, description: '归属会话 id（调试状态按会话隔离，推送到该会话的手机面板）。' },
         program: { type: 'string', required: true, description: '要调试的脚本绝对路径（node 可运行：.js/.mjs）。' },
@@ -843,6 +848,7 @@ export function apply(ctx: Context) {
     ctx.tools.register(defineTool({
       name: 'debug_command',
       description: '控制调试会话：继续(resume)/单步(step)/跳出(step_out)/停止(stop)/读变量(variables)。断点命中后逐步排查；状态同步推送手机面板。',
+      timeoutMs: 10_000,
       parameters: {
         sessionId: { type: 'string', required: true, description: '调试会话归属的会话 id。' },
         action: {
@@ -875,7 +881,13 @@ export function apply(ctx: Context) {
             if (a.variablesReference === undefined || a.variablesReference === '') {
               return { text: 'variables 动作需要 variablesReference（来自暂停帧的 scopes[].variablesReference）' }
             }
-            const vars = await debug.variablesFor(a.sessionId, a.variablesReference)
+            // deadline 兜底：调试器断开/进程退出时 CDP 请求可能永不落定，10s 内必返回
+            const vars = await withTimeout(
+              debug.variablesFor(a.sessionId, a.variablesReference),
+              10_000,
+              () => undefined,
+            )
+            if (vars === undefined) return { text: '调试读变量超时（10s）：调试器无响应，可能已停止/断开' }
             return {
               text: vars.length === 0
                 ? '（无变量，或引用已随恢复失效）'
@@ -883,8 +895,12 @@ export function apply(ctx: Context) {
             }
           }
           if (a.action === 'stop') {
-            await debug.stop(a.sessionId)
-            return { text: '调试会话已停止' }
+            const stopped = await withTimeout(
+              debug.stop(a.sessionId).then(() => true),
+              10_000,
+              () => false,
+            )
+            return { text: stopped ? '调试会话已停止' : '调试停止超时（10s）：调试器无响应，可能已断开' }
           }
           debug.command(a.sessionId, a.action)
           return { text: `已发送 ${a.action} 指令；新状态经 WS 推送（手机面板同步显示）` }
