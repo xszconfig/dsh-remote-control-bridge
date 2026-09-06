@@ -47,6 +47,7 @@ const inboxRemoved = []
 const followupCalls = []
 const injectCalls = []          // LSP 诊断反馈：运行中会话 agent.inject（next-step）记录
 const inboxSteered = []
+const cancelCalls = []          // 中断指令：agent.cancel(cause, options) 记录（mode clear/keep 断言用）
 const commandExecuteCalls = []
 const resumeCalls = []          // ctx.agents.resume 调用记录（休眠会话自动打开）
 const resumedFollowupCalls = [] // 顶层休眠会话恢复后 followup 投递的消息
@@ -141,6 +142,7 @@ const mockAgent = () => ({
       if (l) l({ agent: mockAgent(), status: 'running' })
     }
   },
+  cancel: (cause, options) => { cancelCalls.push({ cause, options }) },
 })
 
 const mockCtx = {
@@ -773,6 +775,39 @@ check('无投影缓存元信息的冷会话：runDurationMs/totalTokens 缺省�
   phone.ws.send(JSON.stringify({ type: 'queue_action', sessionId: 'session-1', itemId: 'm2', action: 'remove' }))
   await new Promise((r) => setTimeout(r, 300))
   check('删除排队消息：remove(m2)', inboxRemoved.includes('m2'), JSON.stringify(inboxRemoved))
+}
+
+// ---- 中断确认：mode=keep 快照用户队列→cancel 清空→followup 重投（自动续消费）；clear/缺省只清空 ----
+{
+  // keep：cancel 清空 + 按快照重投 inbox 里全部用户消息（m1、m2 两条）
+  cancelCalls.length = 0
+  const beforeKeep = followupCalls.length
+  phone.ws.send(JSON.stringify({ type: 'interrupt', sessionId: 'session-1', mode: 'keep' }))
+  await new Promise((r) => setTimeout(r, 200))
+  check('interrupt mode=keep → cancel 清空 + 重投 2 条用户消息（自动续消费）',
+    cancelCalls.length === 1 && cancelCalls[0].options === undefined &&
+    followupCalls.slice(beforeKeep).length === 2,
+    JSON.stringify({ cancel: cancelCalls, followup: followupCalls.slice(beforeKeep).length }))
+
+  // clear：cancel 清空，不重投
+  cancelCalls.length = 0
+  const beforeClear = followupCalls.length
+  phone.ws.send(JSON.stringify({ type: 'interrupt', sessionId: 'session-1', mode: 'clear' }))
+  await new Promise((r) => setTimeout(r, 200))
+  check('interrupt mode=clear → cancel 清空，不重投',
+    cancelCalls.length === 1 && cancelCalls[0].options === undefined &&
+    followupCalls.slice(beforeClear).length === 0,
+    JSON.stringify({ cancel: cancelCalls, followup: followupCalls.slice(beforeClear).length }))
+
+  // 缺省 mode：旧客户端兼容 = clear
+  cancelCalls.length = 0
+  const beforeDefault = followupCalls.length
+  phone.ws.send(JSON.stringify({ type: 'interrupt', sessionId: 'session-1' }))
+  await new Promise((r) => setTimeout(r, 200))
+  check('interrupt 缺省 mode → 清空（旧客户端兼容=clear）',
+    cancelCalls.length === 1 && cancelCalls[0].options === undefined &&
+    followupCalls.slice(beforeDefault).length === 0,
+    JSON.stringify({ cancel: cancelCalls, followup: followupCalls.slice(beforeDefault).length }))
 }
 
 // ---- Goal：goal/change 落库 → goal_update 广播（会话级，延迟重读）----

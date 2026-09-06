@@ -1931,7 +1931,20 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
           })
           break
         }
-        a.cancel({ kind: 'user' })
+        // 中断语义：clear=终止并清空排队（旧行为，缺省）；keep=仅终止当前循环、保留排队。
+        // keep 用「快照用户消息 → cancel 清空 → followup 重投」：DSH 原生 keepInbox 只保留队列
+        // 但不唤醒 agent，队列会停在 idle 无人消费；而 followup 重投既保留全文（非截断展示文本）、
+        // 又同步唤醒 idle agent 自动开启新一轮循环消费（决策④「仅终止保留」后自动续跑）。
+        const mode = cmd.mode === 'keep' ? 'keep' : 'clear'
+        if (mode === 'keep') {
+          const keep = [...a.inbox.nextTurn, ...a.inbox.nextStep].filter((m) => m.source.kind === 'user')
+          a.cancel({ kind: 'user' })
+          for (const m of keep) a.followup(createUserMessage({ content: m.content, source: m.source }))
+          logger.info('INTERRUPT', `中断会话 session=${cmd.sessionId.slice(0, 12)} mode=keep 保留并重投 ${keep.length} 条排队消息`)
+        } else {
+          a.cancel({ kind: 'user' })
+          logger.info('INTERRUPT', `中断会话 session=${cmd.sessionId.slice(0, 12)} mode=clear`)
+        }
         break
       }
       case 'approve': {

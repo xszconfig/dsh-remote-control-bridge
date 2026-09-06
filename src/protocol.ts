@@ -182,6 +182,8 @@ export interface CmdSendMessage {
 export interface CmdInterrupt {
   type: 'interrupt'
   sessionId: string
+  /** 中断模式：clear=终止并清空排队（默认，兼容旧客户端）；keep=仅终止当前循环、保留排队消息。 */
+  mode?: 'clear' | 'keep'
 }
 export interface CmdApprove {
   type: 'approve'
