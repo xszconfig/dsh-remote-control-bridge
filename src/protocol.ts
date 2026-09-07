@@ -168,6 +168,66 @@ export interface QuestionAnswerItemWire {
   custom?: string
 }
 
+// ---- 模型选择与上下文占用（输入区改版新增；对齐客户端 Protocol.kt，全可选向后兼容）----
+
+/** 完整模型选择：provider 路由 / 模型 id / 可选 reasoning effort。 */
+export interface ModelSelectionWire {
+  provider: string
+  model: string
+  reasoningEffort?: string
+}
+/** 单个 reasoning effort 档位（adapter 持有，id 提交回 adapter）。 */
+export interface ModelReasoningEffortWire {
+  id: string
+  name: string
+  description?: string
+}
+/** 某模型的 reasoning 元数据（effort 档位 + 默认档）。 */
+export interface ModelReasoningWire {
+  efforts: ModelReasoningEffortWire[]
+  defaultEffort?: string
+}
+/** 目录内单个模型（含可选 reasoning 元数据）。 */
+export interface ModelCatalogModelWire {
+  id: string
+  name: string
+  description?: string
+  reasoning?: ModelReasoningWire
+}
+/** 一个 provider 分组及其成功列出的模型。 */
+export interface ModelProviderGroupWire {
+  id: string
+  name: string
+  models: ModelCatalogModelWire[]
+}
+/** 目录加载失败的 provider（id/name/失败原因）。 */
+export interface ModelCatalogFailureWire {
+  id: string
+  name: string
+  message: string
+}
+/** 每会话模型目录快照（对齐 DSH Web `SessionModels`）。 */
+export interface SessionModelsWire {
+  current: ModelSelectionWire | null
+  routable: boolean | null
+  groups: ModelProviderGroupWire[]
+  failures: ModelCatalogFailureWire[]
+}
+/** 上下文启发式组成（系统提示 / 工具 schema / 对话 surface；近似值，不等于占用分子）。 */
+export interface ContextBreakdownWire {
+  systemTokens: number
+  toolsTokens: number
+  messageTokens: number
+}
+/** 上下文窗口占用（对齐 DSH Web contextPressure + contextBreakdown）。 */
+export interface ContextUsageWire {
+  contextWindow?: number
+  pressureTokens?: number
+  projectedTokens?: number
+  percent?: number
+  breakdown?: ContextBreakdownWire
+}
+
 // ---- client -> server commands ----
 
 export interface CmdSubscribe {
@@ -178,6 +238,14 @@ export interface CmdSendMessage {
   type: 'send_message'
   sessionId: string
   text: string
+}
+/** 切换当前会话模型（下一步 prompt 组装边界生效；reasoningEffort 可选）。 */
+export interface CmdSetModel {
+  type: 'set_model'
+  sessionId: string
+  provider: string
+  model: string
+  reasoningEffort?: string
 }
 export interface CmdInterrupt {
   type: 'interrupt'
@@ -257,6 +325,7 @@ export interface CmdDebugCommand {
 export type ClientCommand =
   | CmdSubscribe
   | CmdSendMessage
+  | CmdSetModel
   | CmdInterrupt
   | CmdApprove
   | CmdAnswerApproval
@@ -372,6 +441,18 @@ export interface EvCommandsUpdate {
   type: 'commands_update'
   sessionId: string
   commands: CommandWire[]
+}
+/** 模型目录快照推送（当前选择 + provider 分组 + routable）。 */
+export interface EvModelsUpdate {
+  type: 'models_update'
+  sessionId: string
+  models: SessionModelsWire
+}
+/** 上下文窗口占用推送（总量 + 分类近似组成）。 */
+export interface EvContextUsage {
+  type: 'context_usage'
+  sessionId: string
+  usage: ContextUsageWire
 }
 /** 排队消息投影：placement = queued(下一轮)/steering(用户插队中)/context(系统注入)。 */
 export interface QueueItemWire {
@@ -578,6 +659,8 @@ export type ServerEvent =
   | EvGoalUpdate
   | EvTodosUpdate
   | EvCommandsUpdate
+  | EvModelsUpdate
+  | EvContextUsage
   | EvDebugState
   | EvDebugOutput
   | EvDebugVariables
