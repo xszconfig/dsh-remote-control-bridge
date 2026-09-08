@@ -897,14 +897,18 @@ check('无投影缓存元信息的冷会话：runDurationMs/totalTokens 缺省�
     { seq: 102, time: 2100, type: 'user/message', data: { source: { kind: 'plugin', plugin: 'dsh-agent-instructions', form: 'instructions' }, content: [{ type: 'text', text: '<system-reminder>Updated instructions from: AGENTS.md</system-reminder>' }] } },
     { seq: 103, time: 2200, type: 'user/message', data: { source: { kind: 'plugin', plugin: 'dsh-remote-control-bridge', form: 'notice' }, content: [{ type: 'text', text: '【LSP 编译错误】检测到 1 个编译错误' }] } },
     { seq: 104, time: 2300, type: 'user/message', data: { content: [{ type: 'text', text: '无 source 的历史节点' }] } },
+    { seq: 105, time: 2400, type: 'user/message', data: { source: { kind: 'coordinator', form: 'relay', senderSessionId: 'parent-session' }, content: [{ type: 'text', text: '用户已拍板：实施 Jugg MVP，这单交给你' }] } },
+    { seq: 106, time: 2500, type: 'user/message', data: { source: { kind: 'skill-catalog', form: 'catalog' }, content: [{ type: 'text', text: '<system-reminder>The available skill catalog changed</system-reminder>' }] } },
   ]
   phone.ws.send(JSON.stringify({ type: 'subscribe', sessionId: 'session-1' }))
-  const hist = await awaitMsg(phone.msgs, (m) => m.type === 'history' && m.sessionId === 'session-1' && m.total === 4, '消息来源分类历史')
+  const hist = await awaitMsg(phone.msgs, (m) => m.type === 'history' && m.sessionId === 'session-1' && m.total === 6, '消息来源分类历史')
   const bySeq = Object.fromEntries(hist.events.map((e) => [e.seq, e]))
   check('真实用户输入 → source=user（用户气泡）', bySeq[101]?.type === 'user_message' && bySeq[101]?.source === 'user', JSON.stringify(bySeq[101]))
   check('AGENTS.md <system-reminder> 注入 → source=inject（非用户气泡）', bySeq[102]?.type === 'user_message' && bySeq[102]?.source === 'inject', JSON.stringify(bySeq[102]))
   check('LSP 编译错误反馈注入 → source=inject（非用户气泡）', bySeq[103]?.type === 'user_message' && bySeq[103]?.source === 'inject', JSON.stringify(bySeq[103]))
   check('无 source 的历史节点降级 → source=inject（不误判为用户）', bySeq[104]?.type === 'user_message' && bySeq[104]?.source === 'inject', JSON.stringify(bySeq[104]))
+  check('父 agent relay（coordinator）→ source=user（子代理视角的用户消息，转盘可定位）', bySeq[105]?.type === 'user_message' && bySeq[105]?.source === 'user', JSON.stringify(bySeq[105]))
+  check('skill-catalog 系统注入 → source=inject（仍排除，不误判为用户）', bySeq[106]?.type === 'user_message' && bySeq[106]?.source === 'inject', JSON.stringify(bySeq[106]))
   mockSession.events = []
 }
 
