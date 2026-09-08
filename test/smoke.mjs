@@ -15,6 +15,8 @@ const TMP = process.env.DSH_HOME
 process.env.DSH_REMOTE_RESUME_DELAY_MS = '300'
 // 离线冒烟：关闭热重载 watcher（避免对 lib/ 挂 watcher；/remote/reload、/remote/hot 端点仍注册）
 process.env.DSH_REMOTE_HOT_RELOAD = '0'
+// 离线冒烟：关闭 LAN 二级监听（避免绑定 0.0.0.0:3081 与真实部署/并行测试冲突；ack/幂等/ping 走回环 upgrade 入口即可测）
+process.env.DSH_REMOTE_LAN = '0'
 {
   const fsInit = await import('node:fs')
   const workHome = process.env.DSH_HOME ?? (process.env.HOME + '/.dsh')
@@ -32,9 +34,8 @@ const check = (label, cond, detail = '') => {
   console.log(`${cond ? 'PASS' : 'FAIL'}  ${label}${detail ? `  (${detail})` : ''}`)
 }
 
-// 版本兼容断言：live 服务器在部署 0.13.0 前仍是 0.12.0，两版都过；
-// 部署 0.13.0 后收紧为 === '0.13.0'。
-const isVersion = (v) => v === '0.12.0' || v === '0.13.0'
+// 版本兼容断言：0.14.0 起 send_message 增 msgId/ack + 应用层 ping/pong + LAN 二级监听。
+const isVersion = (v) => v === '0.12.0' || v === '0.13.0' || v === '0.14.0'
 
 // ---- mock ctx ----
 const routes = new Map()
@@ -712,6 +713,44 @@ check('无投影缓存元信息的冷会话：runDurationMs/totalTokens 缺省�
     JSON.stringify(followupCalls[followupCalls.length - 1]?.content?.[0]?.text))
 }
 
+// ---- 消息必达（0.14.0）：ack + 幂等去重 + 应用层 ping/pong ----
+{
+  // 1) 应用层 ping → pong（客户端判活）
+  phone.msgs.length = 0
+  phone.ws.send(JSON.stringify({ type: 'ping' }))
+  const pong = await awaitMsg(phone.msgs, (m) => m.type === 'pong', '应用层 pong')
+  check('应用层 ping → pong（判活）', pong?.type === 'pong', JSON.stringify(pong))
+
+  // 2) 携带 msgId → ack{ok:true} + followup 投递一次
+  phone.msgs.length = 0
+  const beforeAck = followupCalls.length
+  phone.ws.send(JSON.stringify({ type: 'send_message', sessionId: 'session-1', text: '带 msgId 消息', msgId: 'msg-ack-1' }))
+  const ack1 = await awaitMsg(phone.msgs, (m) => m.type === 'ack' && m.msgId === 'msg-ack-1', 'ack msg-ack-1')
+  check('携带 msgId → ack{ok:true}', ack1?.ok === true, JSON.stringify(ack1))
+  check('携带 msgId → followup 投递一次',
+    followupCalls.length === beforeAck + 1 && followupCalls[followupCalls.length - 1].content?.[0]?.text === '带 msgId 消息',
+    JSON.stringify(followupCalls.length - beforeAck))
+
+  // 3) 同 msgId 重发 → 幂等去重（不重复 followup，仍回 ack）
+  phone.msgs.length = 0
+  const beforeDup = followupCalls.length
+  phone.ws.send(JSON.stringify({ type: 'send_message', sessionId: 'session-1', text: '带 msgId 消息', msgId: 'msg-ack-1' }))
+  const ackDup = await awaitMsg(phone.msgs, (m) => m.type === 'ack' && m.msgId === 'msg-ack-1', 'ack 幂等重发')
+  await new Promise((r) => setTimeout(r, 200))
+  check('同 msgId 重发 → 幂等去重（不重复 followup）', ackDup?.ok === true && followupCalls.length === beforeDup,
+    JSON.stringify({ ok: ackDup?.ok, delta: followupCalls.length - beforeDup }))
+
+  // 4) 无 msgId（旧客户端兼容）→ 不回 ack、仍 followup 投递
+  phone.msgs.length = 0
+  const beforeLegacy = followupCalls.length
+  phone.ws.send(JSON.stringify({ type: 'send_message', sessionId: 'session-1', text: '旧客户端无 msgId' }))
+  await new Promise((r) => setTimeout(r, 300))
+  const legacyAck = phone.msgs.find((m) => m.type === 'ack')
+  check('无 msgId（旧客户端）→ 不回 ack、仍 followup',
+    legacyAck === undefined && followupCalls.length === beforeLegacy + 1,
+    JSON.stringify({ ack: legacyAck?.msgId ?? null, delta: followupCalls.length - beforeLegacy }))
+}
+
 // ---- 斜杠命令投影：command/run → running 行；command/done → done 行（补命令名 + 结果）----
 {
   phone.msgs.length = 0
@@ -775,6 +814,20 @@ check('无投影缓存元信息的冷会话：runDurationMs/totalTokens 缺省�
   phone.ws.send(JSON.stringify({ type: 'queue_action', sessionId: 'session-1', itemId: 'm2', action: 'remove' }))
   await new Promise((r) => setTimeout(r, 300))
   check('删除排队消息：remove(m2)', inboxRemoved.includes('m2'), JSON.stringify(inboxRemoved))
+
+  // 失败路径：itemId 不在 inbox → queue-item-not-found（客户端据此刷新队列并提示「正在处理」，不静默消失）
+  phone.msgs.length = 0
+  phone.ws.send(JSON.stringify({ type: 'queue_action', sessionId: 'session-1', itemId: 'nonexistent', action: 'steer' }))
+  const nfErr = await awaitMsg(phone.msgs, (m) => m.type === 'error' && m.code === 'queue-item-not-found', 'queue-item-not-found 错误')
+  check('插队/删除不存在的 itemId → queue-item-not-found', nfErr !== undefined, JSON.stringify(nfErr))
+
+  // 失败路径：非 running 时 steer → steer-unavailable（文案含「消息仍在排队」，安抚不丢）
+  agentStatus = 'idle'
+  phone.msgs.length = 0
+  phone.ws.send(JSON.stringify({ type: 'queue_action', sessionId: 'session-1', itemId: 'm1', action: 'steer' }))
+  const suErr = await awaitMsg(phone.msgs, (m) => m.type === 'error' && m.code === 'steer-unavailable', 'steer-unavailable 错误')
+  check('非 running steer → steer-unavailable 且文案含「消息仍在排队」', suErr !== undefined && suErr.message.includes('消息仍在排队'), JSON.stringify(suErr))
+  agentStatus = 'running'
 }
 
 // ---- 中断确认：mode=keep 快照用户队列→cancel 清空→followup 重投（自动续消费）；clear/缺省只清空 ----

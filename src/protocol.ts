@@ -238,6 +238,18 @@ export interface CmdSendMessage {
   type: 'send_message'
   sessionId: string
   text: string
+  /**
+   * 客户端幂等键（发送状态机里每条消息的唯一 id）。缺省 = 旧客户端，服务端不回 ack、不做幂等去重；
+   * 携带时服务端处理完回 `ack{msgId, ok}`，重复的 msgId 只投递一次（at-least-once 语义）。
+   */
+  msgId?: string
+}
+/**
+ * 应用层心跳（客户端判活）：客户端发 ping，服务端回 pong；超时未回 pong = 假连接判死。
+ * 与协议层 ws.ping/pong（RFC6455）并存，独立于库自动回包，走业务帧通道。
+ */
+export interface CmdPing {
+  type: 'ping'
 }
 /** 切换当前会话模型（下一步 prompt 组装边界生效；reasoningEffort 可选）。 */
 export interface CmdSetModel {
@@ -325,6 +337,7 @@ export interface CmdDebugCommand {
 export type ClientCommand =
   | CmdSubscribe
   | CmdSendMessage
+  | CmdPing
   | CmdSetModel
   | CmdInterrupt
   | CmdApprove
@@ -623,6 +636,16 @@ export interface EvError {
   code: string
   message: string
 }
+/** send_message 的送达确认：msgId 对应客户端幂等键；ok=false 表示服务端处理失败（客户端可重发）。 */
+export interface EvAck {
+  type: 'ack'
+  msgId: string
+  ok: boolean
+}
+/** 应用层心跳应答（对应客户端 CmdPing）。 */
+export interface EvPong {
+  type: 'pong'
+}
 /** Answer to register_device: the phone stores this token for reconnects. */
 export interface WireEndpoint {
   host: string
@@ -673,6 +696,8 @@ export type ServerEvent =
   | EvQuestionRequest
   | EvQuestionResolved
   | EvError
+  | EvAck
+  | EvPong
   | EvDeviceRegistered
   | EvDeviceRevoked
 
@@ -710,4 +735,4 @@ export interface DeviceRecord {
   lastSeenAt: number
 }
 
-export const BRIDGE_VERSION = '0.13.0'
+export const BRIDGE_VERSION = '0.14.0'

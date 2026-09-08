@@ -145,6 +145,63 @@ export interface QuestionAnswerItemWire {
     selected: string[];
     custom?: string;
 }
+/** 完整模型选择：provider 路由 / 模型 id / 可选 reasoning effort。 */
+export interface ModelSelectionWire {
+    provider: string;
+    model: string;
+    reasoningEffort?: string;
+}
+/** 单个 reasoning effort 档位（adapter 持有，id 提交回 adapter）。 */
+export interface ModelReasoningEffortWire {
+    id: string;
+    name: string;
+    description?: string;
+}
+/** 某模型的 reasoning 元数据（effort 档位 + 默认档）。 */
+export interface ModelReasoningWire {
+    efforts: ModelReasoningEffortWire[];
+    defaultEffort?: string;
+}
+/** 目录内单个模型（含可选 reasoning 元数据）。 */
+export interface ModelCatalogModelWire {
+    id: string;
+    name: string;
+    description?: string;
+    reasoning?: ModelReasoningWire;
+}
+/** 一个 provider 分组及其成功列出的模型。 */
+export interface ModelProviderGroupWire {
+    id: string;
+    name: string;
+    models: ModelCatalogModelWire[];
+}
+/** 目录加载失败的 provider（id/name/失败原因）。 */
+export interface ModelCatalogFailureWire {
+    id: string;
+    name: string;
+    message: string;
+}
+/** 每会话模型目录快照（对齐 DSH Web `SessionModels`）。 */
+export interface SessionModelsWire {
+    current: ModelSelectionWire | null;
+    routable: boolean | null;
+    groups: ModelProviderGroupWire[];
+    failures: ModelCatalogFailureWire[];
+}
+/** 上下文启发式组成（系统提示 / 工具 schema / 对话 surface；近似值，不等于占用分子）。 */
+export interface ContextBreakdownWire {
+    systemTokens: number;
+    toolsTokens: number;
+    messageTokens: number;
+}
+/** 上下文窗口占用（对齐 DSH Web contextPressure + contextBreakdown）。 */
+export interface ContextUsageWire {
+    contextWindow?: number;
+    pressureTokens?: number;
+    projectedTokens?: number;
+    percent?: number;
+    breakdown?: ContextBreakdownWire;
+}
 export interface CmdSubscribe {
     type: 'subscribe';
     sessionId?: string;
@@ -153,6 +210,26 @@ export interface CmdSendMessage {
     type: 'send_message';
     sessionId: string;
     text: string;
+    /**
+     * 客户端幂等键（发送状态机里每条消息的唯一 id）。缺省 = 旧客户端，服务端不回 ack、不做幂等去重；
+     * 携带时服务端处理完回 `ack{msgId, ok}`，重复的 msgId 只投递一次（at-least-once 语义）。
+     */
+    msgId?: string;
+}
+/**
+ * 应用层心跳（客户端判活）：客户端发 ping，服务端回 pong；超时未回 pong = 假连接判死。
+ * 与协议层 ws.ping/pong（RFC6455）并存，独立于库自动回包，走业务帧通道。
+ */
+export interface CmdPing {
+    type: 'ping';
+}
+/** 切换当前会话模型（下一步 prompt 组装边界生效；reasoningEffort 可选）。 */
+export interface CmdSetModel {
+    type: 'set_model';
+    sessionId: string;
+    provider: string;
+    model: string;
+    reasoningEffort?: string;
 }
 export interface CmdInterrupt {
     type: 'interrupt';
@@ -228,7 +305,7 @@ export interface CmdDebugCommand {
     action: 'resume' | 'step' | 'step_out' | 'stop' | 'variables';
     variablesReference?: string;
 }
-export type ClientCommand = CmdSubscribe | CmdSendMessage | CmdInterrupt | CmdApprove | CmdAnswerApproval | CmdAnswerQuestion | CmdList | CmdHistoryPage | CmdQueueAction | CmdUploadLogs | CmdRegisterDevice | CmdRevokeDevice | CmdDebugCommand;
+export type ClientCommand = CmdSubscribe | CmdSendMessage | CmdPing | CmdSetModel | CmdInterrupt | CmdApprove | CmdAnswerApproval | CmdAnswerQuestion | CmdList | CmdHistoryPage | CmdQueueAction | CmdUploadLogs | CmdRegisterDevice | CmdRevokeDevice | CmdDebugCommand;
 export interface EvHello {
     type: 'hello';
     version: string;
@@ -335,6 +412,18 @@ export interface EvCommandsUpdate {
     type: 'commands_update';
     sessionId: string;
     commands: CommandWire[];
+}
+/** 模型目录快照推送（当前选择 + provider 分组 + routable）。 */
+export interface EvModelsUpdate {
+    type: 'models_update';
+    sessionId: string;
+    models: SessionModelsWire;
+}
+/** 上下文窗口占用推送（总量 + 分类近似组成）。 */
+export interface EvContextUsage {
+    type: 'context_usage';
+    sessionId: string;
+    usage: ContextUsageWire;
 }
 /** 排队消息投影：placement = queued(下一轮)/steering(用户插队中)/context(系统注入)。 */
 export interface QueueItemWire {
@@ -508,6 +597,16 @@ export interface EvError {
     code: string;
     message: string;
 }
+/** send_message 的送达确认：msgId 对应客户端幂等键；ok=false 表示服务端处理失败（客户端可重发）。 */
+export interface EvAck {
+    type: 'ack';
+    msgId: string;
+    ok: boolean;
+}
+/** 应用层心跳应答（对应客户端 CmdPing）。 */
+export interface EvPong {
+    type: 'pong';
+}
 /** Answer to register_device: the phone stores this token for reconnects. */
 export interface WireEndpoint {
     host: string;
@@ -526,7 +625,7 @@ export interface EvDeviceRevoked {
     type: 'device_revoked';
     deviceId: string;
 }
-export type ServerEvent = EvHello | EvSessions | EvAgents | EvEvent | EvHistory | EvSessionQueue | EvLogsRequest | EvModelWaiting | EvModelWaitingDone | EvDeepDivingTick | EvTurnStatus | EvThinkDelta | EvDiagnostics | EvGoalUpdate | EvTodosUpdate | EvCommandsUpdate | EvDebugState | EvDebugOutput | EvDebugVariables | EvServerBoot | EvSessionTitle | EvSessionUpsert | EvAgentStatus | EvApprovalRequest | EvApprovalResolved | EvQuestionRequest | EvQuestionResolved | EvError | EvDeviceRegistered | EvDeviceRevoked;
+export type ServerEvent = EvHello | EvSessions | EvAgents | EvEvent | EvHistory | EvSessionQueue | EvLogsRequest | EvModelWaiting | EvModelWaitingDone | EvDeepDivingTick | EvTurnStatus | EvThinkDelta | EvDiagnostics | EvGoalUpdate | EvTodosUpdate | EvCommandsUpdate | EvModelsUpdate | EvContextUsage | EvDebugState | EvDebugOutput | EvDebugVariables | EvServerBoot | EvSessionTitle | EvSessionUpsert | EvAgentStatus | EvApprovalRequest | EvApprovalResolved | EvQuestionRequest | EvQuestionResolved | EvError | EvAck | EvPong | EvDeviceRegistered | EvDeviceRevoked;
 export interface PingInfo {
     ok: true;
     version: string;
@@ -555,4 +654,4 @@ export interface DeviceRecord {
     createdAt: number;
     lastSeenAt: number;
 }
-export declare const BRIDGE_VERSION = "0.13.0";
+export declare const BRIDGE_VERSION = "0.14.0";

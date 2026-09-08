@@ -26,6 +26,9 @@ const TS_ONLY = {
   EvAgents: 'TS 历史遗留事件，core.ts 从不广播（Kotlin 未镜像）',
   PairInfo: 'REST /remote/pair-info 响应（App 只消费二维码里的 PairQrPayload）',
   DeviceRecord: 'REST /remote/devices 脱敏条目（App 不消费该端点）',
+  EvAck: '阶段1 消息必达新增：App 侧 Protocol.kt Ack 镜像在途（App 子代理负责，落地后移除此豁免）',
+  EvPong: '阶段1 判活新增：App 侧 Protocol.kt Pong 镜像在途（App 子代理负责，落地后移除此豁免）',
+  CmdPing: '阶段1 判活新增：App 侧 Protocol.kt Ping 镜像在途（App 子代理负责，落地后移除此豁免）',
 }
 
 // Kotlin @Serializable 类在 TS protocol.ts 无对应 interface
@@ -50,8 +53,10 @@ const NAME_MAP = {
 }
 
 // 字段级 allowlist（`<类型>.<字段>:<方向>`；方向 kt=Kotlin 缺该字段，ts=TS 缺该字段）
-// 当前为空：0.13.0 的 Hello.lsp/work 漂移已在 App 侧补上，不作为 allowlist 豁免。
-const FIELD_ALLOWLIST = new Set([])
+// 当前仅 1 条：CmdSendMessage.msgId 为阶段1 新增，App 侧 SendMessage.msgId 镜像在途（App 子代理负责）。
+const FIELD_ALLOWLIST = new Set([
+  'CmdSendMessage.msgId:kt',
+])
 
 // ---- 解析：protocol.ts 的 interface 字段集合 ----
 
