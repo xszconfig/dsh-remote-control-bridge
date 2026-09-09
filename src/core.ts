@@ -33,6 +33,7 @@ import {
   type DeviceRecord,
   type DiffWire,
   type EventProjection,  type EventSource,  type EvHello,
+  type DeliveryNoticeWire,
   type GoalWire,
   type LogEntryWire,
   type PairInfo,
@@ -44,6 +45,7 @@ import {
   type WorkspaceSummary,
 } from './protocol.js'
 import { ConnLogger } from './logger.js'
+import { loadDeliveries, writeDeliveries, type DeliveryRecord } from './deliveries.js'
 import { allowLocalOrEnvToken, bearerToken, denied, isLoopback, isLoopbackHostHeader, json } from './auth.js'
 
 // core 版本号对外暴露（ReloadController 读取 mod.BRIDGE_VERSION 作为 /remote/hot 的 coreVersion）
@@ -80,6 +82,8 @@ const serverId = loadOrCreateServerId()
 const host = hostname()
 /** 持久化工作状态：重启后自报版本 + 恢复进行中事项/待办（自动续跑）。 */
 const WORK_FILE = join(dshHome, 'remote-control-work.json')
+/** 结果交付通知台账：会话×轮次的交付事件持久化（重连补发，不丢）。 */
+const DELIVERIES_FILE = join(dshHome, 'remote-control-deliveries.json')
 
 interface StoredDevice extends DeviceRecord {
   token: string
@@ -676,6 +680,7 @@ export function apply(ctx: Context) {
     pendingApprovals: pendingApprovalList(),
     pendingRemoteApprovals: [...muxRemoteApprovals.values()],
     pendingQuestions: [...muxQuestions.values()],
+    pendingDeliveries: [...deliveryRecords],
     lsp: { languages: lsp.availableLangs() },
     work: (() => {
       const w = loadWorkState(WORK_FILE)
@@ -1143,6 +1148,11 @@ export function apply(ctx: Context) {
   // turnStarts：会话 → 本轮开始时间（turn/start 事件）。Deep Diving 显示"本轮累计耗时"，
   // 跨多次模型调用不重置——与旧版客户端语义一致，但时钟在服务端。
   const turnStarts = new Map<string, number>()
+  // ---- 结果交付通知（服务端权威 turnKey + 台账持久化 + 重连补发）----
+  // deliveryRecords：未确认投递的通知台账（启动加载，消费确认后删除，每次变更即落盘）。
+  let deliveryRecords: DeliveryRecord[] = loadDeliveries(DELIVERIES_FILE)
+  // turnOutput：会话 → 本轮是否有「最终结论(assistant) / 非空工具产出(tool)」，降噪用（turn/start 重置）。
+  const turnOutput = new Map<string, { assistant: number; tool: number }>()
   /** 与 @deepseek-ai/dsh-commands 的 parseCommand 同构：仅"行首斜杠 + 合法命令名"才走命令通道。 */
   const SLASH_COMMAND_RE = /^\/([a-z][a-z0-9_-]*)(?=$|[\t\n\r ])/u
   /** ctx.get('commands') 的软读形状（DSH commands 服务：与 Web composer 同一条执行链）。 */
@@ -1204,6 +1214,47 @@ export function apply(ctx: Context) {
     }
   }, 1000)
   divingTicker.unref?.()
+
+  /**
+   * 结果交付：轮次结束（turn/end）时生成服务端权威 turnKey + 降噪判定 + 台账落盘 + 实时广播。
+   * 降噪与 App 旧 hasDeliverySubstance 同语义：主会话认 assistant 最终结论，子代理认非空 tool_result 或 assistant。
+   */
+  const maybeDeliverOnTurnEnd = (session: Session): void => {
+    try {
+      const sid = String(session.id)
+      const to = turnOutput.get(sid)
+      turnOutput.delete(sid) // 轮次结束即清理，下一轮 turn/start 重建
+      if (to === undefined) return
+      const sub = (session.header.delegationDepth ?? 0) > 0 || session.header.origin === 'subagent'
+      const substantive = sub ? to.assistant > 0 || to.tool > 0 : to.assistant > 0
+      if (!substantive) {
+        logger.debug('NOTIFY', `结果交付跳过（无实质产出）session=${sid.slice(0, 8)} subagent=${sub}`)
+        return
+      }
+      const notice: DeliveryNoticeWire = {
+        sessionId: sid,
+        turnKey: randomUUID(),
+        title: '结果已就绪',
+        body: deliveryCompleteBody(displayTitleOf(session), sub),
+        isSubagent: sub,
+        completedAt: Date.now(),
+      }
+      deliveryRecords = [...deliveryRecords, notice]
+      writeDeliveries(DELIVERIES_FILE, deliveryRecords)
+      broadcast({ type: 'delivery_notice', notice })
+      logger.info('NOTIFY', `结果交付通知 session=${sid.slice(0, 8)} turnKey=${notice.turnKey.slice(0, 8)} subagent=${sub} 台账=${deliveryRecords.length}`)
+    } catch (e: unknown) {
+      logger.warn('NOTIFY', `结果交付判定失败 session=${String(session.id).slice(0, 12)}: ${String(e)}`)
+    }
+  }
+
+  /** 结果交付降噪：把单条投影记入本轮产出（assistant 最终结论 / 非空 tool_result）。 */
+  const trackTurnOutput = (to: { assistant: number; tool: number }, proj: EventProjection): void => {
+    if (proj.type === 'assistant_message') to.assistant = Date.now()
+    else if (proj.type === 'tool_result' && typeof proj.toolResult === 'string' && proj.toolResult !== '') {
+      to.tool = Date.now()
+    }
+  }
 
   // ---- live event fan-out ----
   ctx.on('session/event', (session, event) => {
@@ -1305,6 +1356,8 @@ export function apply(ctx: Context) {
       const t0 = Date.now()
       try {
         turnStarts.set(String(session.id), t0)
+        // 新一轮：重置结果交付降噪标记（本轮是否已有最终结论/非空工具产出）
+        turnOutput.set(String(session.id), { assistant: 0, tool: 0 })
         // 新一轮：重置 LSP 诊断反馈的轮次注入上限与批次指纹（新一轮重新计数）
         lspFeedback.markTurnStart(String(session.id))
         broadcast({ type: 'todos_update', sessionId: String(session.id), todos: [] })
@@ -1319,10 +1372,15 @@ export function apply(ctx: Context) {
     if ((event.type as string) === 'turn/end') {
       turnStarts.delete(String(session.id))
       broadcast({ type: 'turn_status', sessionId: String(session.id), open: false })
+      // 结果交付：轮次结束即判定（本轮产出已在投影流程中记入 turnOutput）
+      maybeDeliverOnTurnEnd(session)
     }
     const scope = ctx.agents.get(session.id)
+    // 结果交付降噪：实时投影时记录本轮是否有最终结论(assistant_message)/非空工具产出(tool_result)
+    const to = turnOutput.get(String(session.id))
     for (const proj of projectEvent(ctx, event, scope)) {
       broadcast({ type: 'event', sessionId: String(session.id), event: proj })
+      if (to !== undefined) trackTurnOutput(to, proj)
     }
     // LSP：实时事件里 Agent 编辑/写入文件 → 触发语言诊断（历史投影不触发，避免重放风暴）
     if (event.type === 'tool/call') {
@@ -1727,6 +1785,19 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
         send(ws, { type: 'pong' })
         break
       }
+      case 'confirm_delivery': {
+        // 结果交付确认：手机按 (sessionId, turnKey) 幂等消费后回传，桥删除台账记录（标记已投递）。
+        const keys = new Set((cmd.deliveries ?? []).map((d) => `${d.sessionId}\u0000${d.turnKey}`))
+        const before = deliveryRecords.length
+        if (keys.size > 0) {
+          deliveryRecords = deliveryRecords.filter((r) => !keys.has(`${r.sessionId}\u0000${r.turnKey}`))
+          if (deliveryRecords.length !== before) {
+            writeDeliveries(DELIVERIES_FILE, deliveryRecords)
+          }
+        }
+        logger.info('NOTIFY', `确认投递 ${before - deliveryRecords.length} 条（剩余 ${deliveryRecords.length}）`)
+        break
+      }
       case 'upload_logs': {
         const entries = cmd.entries ?? []
         for (const e of entries) {
@@ -1916,6 +1987,7 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
                 type: 'error',
                 code: 'not_running',
                 message: `该会话当前未在桌面端打开，且自动打开失败：${found.error ?? '未知原因'}`,
+                ...(msgId !== undefined ? { msgId } : {}),
               })
               ack(false)
               break
@@ -1942,7 +2014,7 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
               // handler 抛出：commands 服务已落 command/done（error 行会广播到手机），
               // 这里只补一条连接级报错横幅（罕见路径：command/run 落库失败等无行可看的情况）。
               logger.warn('CMD', `斜杠命令执行异常 name=/${name} session=${cmd.sessionId.slice(0, 12)}: ${String(e)}`)
-              send(ws, { type: 'error', code: 'command_failed', message: `/${name} 执行失败：${String(e)}` })
+              send(ws, { type: 'error', code: 'command_failed', message: `/${name} 执行失败：${String(e)}`, ...(msgId !== undefined ? { msgId } : {}) })
               ack(false)
               break
             }
@@ -2685,6 +2757,13 @@ function renderPairPage(info: PairInfo, svg: string, loopbackOnly: boolean): str
 function isSubagent(a: Agent): boolean {
   const h = a.session.header
   return (h.delegationDepth ?? 0) > 0 || h.origin === 'subagent'
+}
+
+/** 结果交付（完成）正文：与 App NotificationController.deliveryCompleteBody 同语义，改由服务端生成。 */
+function deliveryCompleteBody(sessionTitle: string, isSubagent: boolean): string {
+  const name = sessionTitle.trim()
+  if (isSubagent) return name ? `「${name}」已完成` : '子代理已完成'
+  return name ? `「${name}」本轮已完成` : '本轮已完成'
 }
 
 function lastEventTime(s: Session): number {

@@ -251,6 +251,11 @@ export interface CmdSendMessage {
 export interface CmdPing {
   type: 'ping'
 }
+/** 确认已消费的结果交付通知（幂等键 (sessionId, turnKey)，消费后回传，桥删除台账记录）。 */
+export interface CmdConfirmDelivery {
+  type: 'confirm_delivery'
+  deliveries: { sessionId: string; turnKey: string }[]
+}
 /** 切换当前会话模型（下一步 prompt 组装边界生效；reasoningEffort 可选）。 */
 export interface CmdSetModel {
   type: 'set_model'
@@ -338,6 +343,7 @@ export type ClientCommand =
   | CmdSubscribe
   | CmdSendMessage
   | CmdPing
+  | CmdConfirmDelivery
   | CmdSetModel
   | CmdInterrupt
   | CmdApprove
@@ -352,6 +358,26 @@ export type ClientCommand =
   | CmdDebugCommand
 
 // ---- server -> client events ----
+
+/**
+ * 结果交付通知（服务端权威，重连补发，不丢）。
+ * 幂等键 = (sessionId, turnKey)：turnKey 由桥在 agent 轮次完成（turn/end）时生成（randomUUID），
+ * 客户端不再从 turn_status.since 推导（铁律 6：服务端投影为准）。
+ */
+export interface DeliveryNoticeWire {
+  /** 会话 id。 */
+  sessionId: string
+  /** 服务端权威幂等键：同一「会话×轮次」唯一，客户端按 (sessionId, turnKey) 去重消费。 */
+  turnKey: string
+  /** 通知标题（如「结果已就绪」）。 */
+  title: string
+  /** 通知正文（服务端生成，含会话显示名与主/子代理语义）。 */
+  body: string
+  /** 是否子代理会话（App 据此选通知通道/图标）。 */
+  isSubagent: boolean
+  /** 轮次完成时间（epoch ms，服务端时钟）。 */
+  completedAt: number
+}
 
 export interface EvHello {
   type: 'hello'
@@ -370,6 +396,11 @@ export interface EvHello {
   pendingRemoteApprovals: ApprovalRequestWire[]
   /** 桌面端持有、bridge 经 mux 转发的提问（手机回答走 answer_question）。 */
   pendingQuestions: QuestionRequestWire[]
+  /**
+   * 未确认投递的结果交付通知（重连补发，不丢）：手机按 (sessionId, turnKey) 去重消费后
+   * 回 `confirm_delivery`，桥删除台账记录。缺省 = 空（旧桥无该字段，App 向后兼容）。
+   */
+  pendingDeliveries: DeliveryNoticeWire[]
   /** LSP 代码智能状态：语言 → 是否可用（server 二进制已安装）。 */
   lsp?: { languages: string[] }
   /** 持久化工作状态（重启后自动续跑）：当前事项 + 待办清单。 */
@@ -635,6 +666,8 @@ export interface EvError {
   type: 'error'
   code: string
   message: string
+  /** 可选：服务端拒绝 send_message 时回带的 msgId，客户端据此把失败精确关联回 pending（消除静默失败）。 */
+  msgId?: string
 }
 /** send_message 的送达确认：msgId 对应客户端幂等键；ok=false 表示服务端处理失败（客户端可重发）。 */
 export interface EvAck {
@@ -645,6 +678,11 @@ export interface EvAck {
 /** 应用层心跳应答（对应客户端 CmdPing）。 */
 export interface EvPong {
   type: 'pong'
+}
+/** 结果交付通知事件（轮次完成时实时广播；重连经 hello.pendingDeliveries 补发）。 */
+export interface EvDeliveryNotice {
+  type: 'delivery_notice'
+  notice: DeliveryNoticeWire
 }
 /** Answer to register_device: the phone stores this token for reconnects. */
 export interface WireEndpoint {
@@ -698,6 +736,7 @@ export type ServerEvent =
   | EvError
   | EvAck
   | EvPong
+  | EvDeliveryNotice
   | EvDeviceRegistered
   | EvDeviceRevoked
 
@@ -735,4 +774,4 @@ export interface DeviceRecord {
   lastSeenAt: number
 }
 
-export const BRIDGE_VERSION = '0.14.0'
+export const BRIDGE_VERSION = '0.15.0'

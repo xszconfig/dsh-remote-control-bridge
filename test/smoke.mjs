@@ -34,8 +34,8 @@ const check = (label, cond, detail = '') => {
   console.log(`${cond ? 'PASS' : 'FAIL'}  ${label}${detail ? `  (${detail})` : ''}`)
 }
 
-// 版本兼容断言：0.14.0 起 send_message 增 msgId/ack + 应用层 ping/pong + LAN 二级监听。
-const isVersion = (v) => v === '0.12.0' || v === '0.13.0' || v === '0.14.0'
+// 版本兼容断言：0.15.0 起新增服务端结果交付补投递（delivery_notice + confirm_delivery + hello.pendingDeliveries）。
+const isVersion = (v) => v === '0.12.0' || v === '0.13.0' || v === '0.14.0' || v === '0.15.0'
 
 // ---- mock ctx ----
 const routes = new Map()
@@ -749,6 +749,49 @@ check('无投影缓存元信息的冷会话：runDurationMs/totalTokens 缺省�
   check('无 msgId（旧客户端）→ 不回 ack、仍 followup',
     legacyAck === undefined && followupCalls.length === beforeLegacy + 1,
     JSON.stringify({ ack: legacyAck?.msgId ?? null, delta: followupCalls.length - beforeLegacy }))
+}
+
+// ---- 服务端结果交付补投递（0.15.0）：turnKey 服务端权威 + 台账持久化 + 重连补发 + 确认 ----
+{
+  // 1) 主会话轮次完成且有 assistant 产出 → delivery_notice 广播（降噪：无产出不广播）
+  phone.msgs.length = 0
+  const evD = listeners.get('session/event')
+  if (evD) {
+    // 无产出的轮次：只 turn/start → turn/end（无 assistant/tool）→ 不广播
+    evD(mockSession, { seq: 200, time: Date.now(), type: 'turn/start', data: {} })
+    evD(mockSession, { seq: 201, time: Date.now(), type: 'turn/end', data: {} })
+    // 有产出的轮次：turn/start → assistant → turn/end → 广播
+    evD(mockSession, { seq: 202, time: Date.now(), type: 'turn/start', data: {} })
+    evD(mockSession, { seq: 203, time: Date.now(), type: 'assistant/message', data: { message: { content: [{ type: 'text', text: '最终结论：已完成' }] } } })
+    evD(mockSession, { seq: 204, time: Date.now(), type: 'turn/end', data: {} })
+  }
+  const dn = await awaitMsg(phone.msgs, (m) => m.type === 'delivery_notice', 'delivery_notice 广播')
+  check('主会话轮次完成 → delivery_notice（turnKey 服务端权威）',
+    dn?.notice?.sessionId === 'session-1' && typeof dn?.notice?.turnKey === 'string' && dn?.notice?.turnKey.length > 0
+    && dn?.notice?.isSubagent === false && dn?.notice?.title === '结果已就绪' && dn?.notice?.body.includes('mock'),
+    JSON.stringify(dn?.notice))
+  check('无产出的轮次不广播（降噪，仅 1 条 delivery_notice）',
+    phone.msgs.filter((m) => m.type === 'delivery_notice').length === 1,
+    JSON.stringify(phone.msgs.filter((m) => m.type === 'delivery_notice').map((m) => m.notice?.turnKey)))
+
+  // 2) 重连 hello 补发未确认的交付通知
+  const phoneD = await openPhone()
+  const helloD = await awaitMsg(phoneD.msgs, (m) => m.type === 'hello', '重连 hello 补发')
+  const pending = (helloD?.pendingDeliveries ?? []).filter((d) => d.sessionId === 'session-1')
+  check('重连 hello 含 pendingDeliveries（补发未确认通知）',
+    pending.length === 1 && pending[0].turnKey === dn.notice.turnKey && pending[0].isSubagent === false,
+    JSON.stringify(helloD?.pendingDeliveries))
+
+  // 3) confirm_delivery 确认消费 → 台账删除 → 再重连不再补发
+  phoneD.ws.send(JSON.stringify({ type: 'confirm_delivery', deliveries: [{ sessionId: 'session-1', turnKey: dn.notice.turnKey }] }))
+  await new Promise((r) => setTimeout(r, 300))
+  phoneD.ws.close()
+  const phoneD2 = await openPhone()
+  const helloD2 = await awaitMsg(phoneD2.msgs, (m) => m.type === 'hello', '确认后重连 hello')
+  check('confirm_delivery 后重连不再补发该条（台账已删）',
+    !(helloD2?.pendingDeliveries ?? []).some((d) => d.sessionId === 'session-1' && d.turnKey === dn.notice.turnKey),
+    JSON.stringify(helloD2?.pendingDeliveries))
+  phoneD2.ws.close()
 }
 
 // ---- 斜杠命令投影：command/run → running 行；command/done → done 行（补命令名 + 结果）----
