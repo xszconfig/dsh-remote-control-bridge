@@ -774,4 +774,4 @@ export interface DeviceRecord {
   lastSeenAt: number
 }
 
-export const BRIDGE_VERSION = '0.15.0'
+export const BRIDGE_VERSION = '0.16.0'

@@ -35,7 +35,8 @@ const check = (label, cond, detail = '') => {
 }
 
 // 版本兼容断言：0.15.0 起新增服务端结果交付补投递（delivery_notice + confirm_delivery + hello.pendingDeliveries）。
-const isVersion = (v) => v === '0.12.0' || v === '0.13.0' || v === '0.14.0' || v === '0.15.0'
+// 0.16.0 起新增模型目录/上下文占用（models_update + context_usage + set_model）。
+const isVersion = (v) => v === '0.12.0' || v === '0.13.0' || v === '0.14.0' || v === '0.15.0' || v === '0.16.0'
 
 // ---- mock ctx ----
 const routes = new Map()
@@ -54,6 +55,7 @@ const resumeCalls = []          // ctx.agents.resume 调用记录（休眠会话
 const resumedFollowupCalls = [] // 顶层休眠会话恢复后 followup 投递的消息
 const subagentFollowupCalls = [] // ctx.subagents.followup 调用记录（子代理冷恢复）
 const presetMountCalls = []     // agentPresets.mount 调用记录（resume setup 挂 preset）
+const resolveCallConfigCalls = [] // set_model 命令路由：llm.resolveCallConfig 调用记录
 const eventsListeners = new Map()
 const inboxMessages = [
   { id: 'm1', source: { kind: 'user' }, content: [{ type: 'text', text: '排队的消息1' }] },
@@ -69,6 +71,7 @@ const inbox = {
 const mockSession = {
   id: 'session-1',
   header: { delegationDepth: 0, cwd: '/mock', createdAt: 500 },
+  requestHeader: () => undefined,
   append(type, data) {
     sessionAppendLog.push({ type, data })
   },
@@ -85,6 +88,7 @@ const mockSession = {
 const mockSubSession = {
   id: 'session-sub',
   header: { parentSession: 'session-1', delegationDepth: 1, origin: 'subagent', cwd: '/mock', createdAt: 600 },
+  requestHeader: () => undefined,
   events: [],
 }
 
@@ -127,11 +131,14 @@ const coldSessions = {
 
 // agent 状态可变：模拟真实 harness 的 idle→running 唤醒（followup 同步触发 agent/status running，构成重入）。
 // 修复前 tryResumeIfPending 在指纹写盘前被 followup 的重入再次调用 → 同批待办连发两条续跑指令。
+// 注意：返回**稳定单例**（真实 ctx.agents.list/get 返回同一 agent 对象，WeakMap 选择 ref 按对象身份复用；
+// 若每次新建对象，set_model 的「per-agent 可变选择 ref」会因身份不匹配而失效）。
 let agentStatus = 'running'
-const mockAgent = () => ({
+const liveAgent = {
   id: 'session-1',
-  status: agentStatus,
+  get status() { return agentStatus },
   session: mockSession,
+  ctx: { on: () => () => {} },
   inbox,
   steer: (m) => { inboxSteered.push(m) },
   inject: (m) => { injectCalls.push(m) },
@@ -140,11 +147,12 @@ const mockAgent = () => ({
     if (agentStatus === 'idle') {
       agentStatus = 'running'
       const l = listeners.get('agent/status')
-      if (l) l({ agent: mockAgent(), status: 'running' })
+      if (l) l({ agent: liveAgent, status: 'running' })
     }
   },
   cancel: (cause, options) => { cancelCalls.push({ cause, options }) },
-})
+}
+const mockAgent = () => liveAgent
 
 const mockCtx = {
   webServer: {
@@ -197,6 +205,8 @@ const mockCtx = {
         todos: [{ content: '写协议字段', status: 'in_progress' }, { content: '跑冒烟', status: 'pending' }],
         sessionStats: { turns: 2, steps: 3, llmMs: 5000, toolMs: 3000, ttftMs: 0, ttftSteps: 0, decodeMs: 0, decodeTokens: 0 },
         tokenUsage: { uncachedInputTokens: 100, outputTokens: 200, cacheReadTokens: 30, cacheWriteTokens: 40 },
+        contextPressure: { contextWindow: 128000, pressureTokens: 50000, projectedTokens: 64000 },
+        contextBreakdown: { systemTokens: 8000, toolsTokens: 12000, messageTokens: 32000 },
       }
       if (session && String(session.id) === 'session-sub') {
         values.subagent = { mode: 'one-shot', label: 'Deep Diving 计时闪烁修复', seq: 0 }
@@ -285,6 +295,27 @@ const mockCtx = {
             }
           }
           return { values: {} }
+        },
+      }
+    }
+    if (name === 'llm') {
+      // LLM 服务 mock：模型目录读取（listProviders/listModels/resolveModelInfo）+ 切换（resolveCallConfig）
+      return {
+        listProviders: () => [{ id: 'deepseek', name: 'DeepSeek' }],
+        listModels: async () => [
+          { id: 'deepseek-chat', name: 'DeepSeek Chat', description: '通用对话' },
+          { id: 'deepseek-reasoner', name: 'DeepSeek Reasoner' },
+        ],
+        resolveModelInfo: async (_p, modelId) => ({
+          context: { contextWindow: 128000 },
+          ...(modelId === 'deepseek-reasoner'
+            ? { reasoning: { efforts: [{ id: 'low', name: '低' }, { id: 'high', name: '高' }], defaultEffort: 'low' } }
+            : {}),
+        }),
+        resolveCallConfig: async (config) => {
+          resolveCallConfigCalls.push(config)
+          if (config.model === 'nonexistent') throw new Error('no adapter serves model "nonexistent"')
+          return { provider: config.provider, model: config.model, ...(config.reasoningEffort === undefined ? {} : { reasoningEffort: config.reasoningEffort }) }
         },
       }
     }
@@ -1541,6 +1572,33 @@ process.stdin.on('data', (c) => { buf = Buffer.concat([buf, c]); tryParse() })
   const outs = phone.msgs.filter((m) => m.type === 'debug_output' && m.sessionId === 'session-1')
   // 中间步骤清过缓冲：最后一轮缓冲含 loop 3 / done 3，各一行（双通道去重验证）
   check('console 输出流（loop 3/done 3 可见、无双行）', outs.filter((m) => m.line.includes('loop 3')).length === 1 && outs.filter((m) => m.line.includes('done 3')).length === 1, JSON.stringify(outs.map((m) => m.line)))
+}
+
+// ---- 输入区操作条：模型目录 + 上下文占用 + set_model（v0.16.0）----
+{
+  // subscribe 随订阅下发 context_usage（同步）+ models_update（异步）
+  phone.msgs.length = 0
+  phone.ws.send(JSON.stringify({ type: 'subscribe', sessionId: 'session-1' }))
+  const ctxU = await awaitMsg(phone.msgs, (m) => m.type === 'context_usage' && m.sessionId === 'session-1', 'context_usage 随订阅下发')
+  check('context_usage：percent 服务端算好（64000/128000=50）', ctxU.usage?.percent === 50 && ctxU.usage?.contextWindow === 128000 && ctxU.usage?.projectedTokens === 64000, JSON.stringify(ctxU.usage))
+  check('context_usage：breakdown 三类（系统/工具/对话）', ctxU.usage?.breakdown?.systemTokens === 8000 && ctxU.usage?.breakdown?.toolsTokens === 12000 && ctxU.usage?.breakdown?.messageTokens === 32000, JSON.stringify(ctxU.usage?.breakdown))
+
+  const models = await awaitMsg(phone.msgs, (m) => m.type === 'models_update' && m.sessionId === 'session-1', 'models_update 随订阅下发')
+  check('models_update：current 由 agentDefaultModel 兜底', models.models?.current?.provider === 'deepseek' && models.models?.current?.model === 'deepseek-chat', JSON.stringify(models.models?.current))
+  check('models_update：routable=true + 目录按 provider 分组 + reasoning effort', models.models?.routable === true && models.models?.groups?.length === 1 && models.models?.groups?.[0]?.id === 'deepseek' && models.models?.groups?.[0]?.models?.length === 2 && models.models?.groups?.[0]?.models?.[1]?.reasoning?.efforts?.length === 2 && models.models?.groups?.[0]?.models?.[1]?.reasoning?.defaultEffort === 'low', JSON.stringify(models.models?.groups?.[0]?.models?.map((m) => m.id)))
+
+  // set_model：合法切换 → resolveCallConfig 校验 → models_update 回显新 current
+  phone.msgs.length = 0
+  phone.ws.send(JSON.stringify({ type: 'set_model', sessionId: 'session-1', provider: 'deepseek', model: 'deepseek-reasoner', reasoningEffort: 'high' }))
+  const upd = await awaitMsg(phone.msgs, (m) => m.type === 'models_update' && m.sessionId === 'session-1' && m.models?.current?.model === 'deepseek-reasoner', 'set_model 后 models_update 回显新 current')
+  check('set_model：resolveCallConfig 收到 provider/model/effort', resolveCallConfigCalls.length >= 1 && resolveCallConfigCalls.at(-1)?.provider === 'deepseek' && resolveCallConfigCalls.at(-1)?.model === 'deepseek-reasoner' && resolveCallConfigCalls.at(-1)?.reasoningEffort === 'high', JSON.stringify(resolveCallConfigCalls.at(-1)))
+  check('set_model：models_update.current 更新为新模型', upd.models?.current?.provider === 'deepseek' && upd.models?.current?.model === 'deepseek-reasoner' && upd.models?.current?.reasoningEffort === 'high', JSON.stringify(upd.models?.current))
+
+  // set_model：非法模型 → model_unavailable
+  phone.msgs.length = 0
+  phone.ws.send(JSON.stringify({ type: 'set_model', sessionId: 'session-1', provider: 'deepseek', model: 'nonexistent' }))
+  const err = await awaitMsg(phone.msgs, (m) => m.type === 'error' && m.code === 'model_unavailable', 'set_model 非法模型回 model_unavailable')
+  check('set_model：非法模型回 model_unavailable', err.code === 'model_unavailable', JSON.stringify(err))
 }
 
 phone.ws.close()
