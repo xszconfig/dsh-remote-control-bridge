@@ -36,7 +36,7 @@ const check = (label, cond, detail = '') => {
 
 // 版本兼容断言：0.15.0 起新增服务端结果交付补投递（delivery_notice + confirm_delivery + hello.pendingDeliveries）。
 // 0.16.0 起新增模型目录/上下文占用（models_update + context_usage + set_model）。
-const isVersion = (v) => v === '0.12.0' || v === '0.13.0' || v === '0.14.0' || v === '0.15.0' || v === '0.16.0'
+const isVersion = (v) => v === '0.12.0' || v === '0.13.0' || v === '0.14.0' || v === '0.15.0' || v === '0.16.0' || v === '0.17.0'
 
 // ---- mock ctx ----
 const routes = new Map()
@@ -317,6 +317,15 @@ const mockCtx = {
           if (config.model === 'nonexistent') throw new Error('no adapter serves model "nonexistent"')
           return { provider: config.provider, model: config.model, ...(config.reasoningEffort === undefined ? {} : { reasoningEffort: config.reasoningEffort }) }
         },
+      }
+    }
+    if (name === 'skills') {
+      // DSH skills 服务 mock：ctx.skills.list 返回全部技能摘要（name=kebab id + description + whenToUse）
+      return {
+        list: async () => [
+          { name: 'code-lint', description: '一键跑 lint 拿结构化结果' },
+          { name: 'dsh-restart', description: '重启本机 DSH 服务端', whenToUse: '用户说重启时' },
+        ],
       }
     }
     if (name === 'agentDefaultModel') {
@@ -1599,6 +1608,22 @@ process.stdin.on('data', (c) => { buf = Buffer.concat([buf, c]); tryParse() })
   phone.ws.send(JSON.stringify({ type: 'set_model', sessionId: 'session-1', provider: 'deepseek', model: 'nonexistent' }))
   const err = await awaitMsg(phone.msgs, (m) => m.type === 'error' && m.code === 'model_unavailable', 'set_model 非法模型回 model_unavailable')
   check('set_model：非法模型回 model_unavailable', err.code === 'model_unavailable', JSON.stringify(err))
+}
+
+// ---- 技能面板：skills_update 全量下发 + skills/change 增量广播（v0.17.0）----
+{
+  // 新连接即下发 skills_update（随 hello/server_boot 之后）
+  const phone3 = await openPhone()
+  const initial = await awaitMsg(phone3.msgs, (m) => m.type === 'skills_update', '连接下发 skills_update')
+  check('连接即下发 skills_update（全部技能 name+description+whenToUse）', Array.isArray(initial.skills) && initial.skills.length === 2 && initial.skills[0].name === 'code-lint' && initial.skills[0].description === '一键跑 lint 拿结构化结果' && initial.skills[1].name === 'dsh-restart' && initial.skills[1].whenToUse === '用户说重启时', JSON.stringify(initial.skills?.map((s) => s.name)))
+  phone3.ws.close()
+
+  // skills/change 失效通知 → refetch 全量广播（桌面端增删技能实时反映）
+  phone.msgs.length = 0
+  const sc = eventsListeners.get('skills/change')
+  sc?.()
+  const upd = await awaitMsg(phone.msgs, (m) => m.type === 'skills_update', 'skills/change 后广播 skills_update')
+  check('skills/change 触发 skills_update 广播', Array.isArray(upd.skills) && upd.skills.length === 2 && upd.skills.every((s) => typeof s.name === 'string' && typeof s.description === 'string'), JSON.stringify(upd.skills?.map((s) => s.name)))
 }
 
 phone.ws.close()

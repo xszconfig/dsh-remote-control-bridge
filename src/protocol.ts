@@ -227,6 +227,12 @@ export interface ContextUsageWire {
   percent?: number
   breakdown?: ContextBreakdownWire
 }
+/** 技能目录条目（对齐 DSH `ctx.skills.list()` 的 SkillSummary）：name 即 kebab-case id，DSH 无独立显示名。 */
+export interface SkillWire {
+  name: string
+  description: string
+  whenToUse?: string
+}
 
 // ---- client -> server commands ----
 
@@ -498,6 +504,11 @@ export interface EvContextUsage {
   sessionId: string
   usage: ContextUsageWire
 }
+/** 技能目录全量推送（全部技能，含 name/description/whenToUse；skills/change 或订阅时下发）。 */
+export interface EvSkillsUpdate {
+  type: 'skills_update'
+  skills: SkillWire[]
+}
 /** 排队消息投影：placement = queued(下一轮)/steering(用户插队中)/context(系统注入)。 */
 export interface QueueItemWire {
   id: string
@@ -722,6 +733,7 @@ export type ServerEvent =
   | EvCommandsUpdate
   | EvModelsUpdate
   | EvContextUsage
+  | EvSkillsUpdate
   | EvDebugState
   | EvDebugOutput
   | EvDebugVariables
@@ -774,4 +786,4 @@ export interface DeviceRecord {
   lastSeenAt: number
 }
 
-export const BRIDGE_VERSION = '0.16.0'
+export const BRIDGE_VERSION = '0.17.0'

@@ -46,6 +46,7 @@ import {
   type ServerEvent,
   type SessionModelsWire,
   type SessionSummary,
+  type SkillWire,
   type TodoWire,
   type WorkspaceSummary,
 } from './protocol.js'
@@ -237,6 +238,10 @@ export function apply(ctx: Context) {
   interface SessionProjectionsLike {
     snapshot(s: unknown): { values: Record<string, unknown> }
     onChanged?(listener: (session: unknown, key: string) => void): () => void
+  }
+  /** 技能注册表软类型（ctx.skills.list：全部技能摘要，headless 部署可缺省 → 空目录）。 */
+  interface SkillsLike {
+    list(options?: { cwd?: string; signal?: AbortSignal }): Promise<{ name: string; description: string; whenToUse?: string }[]>
   }
   interface AgentPresetsLike {
     mount(agentCtx: unknown, presetId: string | undefined): Promise<unknown>
@@ -622,6 +627,26 @@ export function apply(ctx: Context) {
     }
     const routable = current === null ? null : providers.some((p) => p.id === current.provider)
     return { current, routable, groups, failures }
+  }
+
+  /**
+   * 全部技能目录 wire（对齐 DSH Web 技能面板：ctx.skills.list，全局层全部技能，按名排序）。
+   * 无 skills 服务（headless 部署）→ 空目录。name 即 kebab-case id，DSH 无独立显示名。
+   */
+  const skillsWireOf = async (): Promise<SkillWire[]> => {
+    const skills = ctx.get('skills') as SkillsLike | undefined
+    if (skills === undefined || typeof skills.list !== 'function') return []
+    try {
+      const list = await skills.list()
+      return list.map((s) => ({
+        name: s.name,
+        description: s.description,
+        ...(s.whenToUse === undefined ? {} : { whenToUse: s.whenToUse }),
+      }))
+    } catch (e: unknown) {
+      logger.warn('SKILL', `技能目录读取失败（降级空目录）: ${String(e)}`)
+      return []
+    }
   }
 
   /** Desktop display title: durable title, cwd basename, then id. */
@@ -1578,6 +1603,11 @@ export function apply(ctx: Context) {
     })
   }
 
+  // 技能目录变更（DSH skills 服务 skills/change 失效通知）→ refetch 全量广播，桌面端增删技能实时反映。
+  ctx.events.on('skills/change', () => {
+    void skillsWireOf().then((skills) => broadcast({ type: 'skills_update', skills }))
+  })
+
   // ---- approval answerer (mobile decides; desktop falls back) ----
 
   /**
@@ -2416,6 +2446,8 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
         bootedAt,
         notes: work?.notes ?? [],
       })
+      // 技能目录：连接即下发全量（浏览面板数据源；变更走 skills/change 增量广播）
+      void skillsWireOf().then((skills) => send(ws, { type: 'skills_update', skills }))
     })
     ws.on('pong', () => {
       wsState(ws).alive = true
