@@ -1608,6 +1608,12 @@ process.stdin.on('data', (c) => { buf = Buffer.concat([buf, c]); tryParse() })
   phone.ws.send(JSON.stringify({ type: 'set_model', sessionId: 'session-1', provider: 'deepseek', model: 'nonexistent' }))
   const err = await awaitMsg(phone.msgs, (m) => m.type === 'error' && m.code === 'model_unavailable', 'set_model 非法模型回 model_unavailable')
   check('set_model：非法模型回 model_unavailable', err.code === 'model_unavailable', JSON.stringify(err))
+
+  // llm/adapters-updated → 重读各活跃会话目录广播（桌面端增删模型实时反映）
+  phone.msgs.length = 0
+  eventsListeners.get('llm/adapters-updated')?.()
+  const modelsUpd = await awaitMsg(phone.msgs, (m) => m.type === 'models_update' && m.sessionId === 'session-1', 'llm/adapters-updated 后广播 models_update')
+  check('llm/adapters-updated 触发 models_update 广播', Array.isArray(modelsUpd.models?.groups) && modelsUpd.models.groups.length >= 1, JSON.stringify(modelsUpd.models?.groups?.map((g) => g.id)))
 }
 
 // ---- 技能面板：skills_update 全量下发 + skills/change 增量广播（v0.17.0）----

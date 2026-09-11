@@ -1608,6 +1608,16 @@ export function apply(ctx: Context) {
     void skillsWireOf().then((skills) => broadcast({ type: 'skills_update', skills }))
   })
 
+  // 模型目录变更（llm/adapters-updated / settings/document-updated）→ 重读各活跃会话目录广播，
+  // 桌面端增删模型 / 改 provider 配置实时反映到手机（对齐 Web 的 ModelDirectory refetch）。
+  const broadcastModels = (): void => {
+    for (const agent of ctx.agents.list()) {
+      void modelsWireOf(String(agent.id)).then((models) => broadcast({ type: 'models_update', sessionId: String(agent.id), models }))
+    }
+  }
+  ctx.events.on('llm/adapters-updated', broadcastModels)
+  ctx.events.on('settings/document-updated', broadcastModels)
+
   // ---- approval answerer (mobile decides; desktop falls back) ----
 
   /**
