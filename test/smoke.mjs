@@ -1619,6 +1619,12 @@ process.stdin.on('data', (c) => { buf = Buffer.concat([buf, c]); tryParse() })
   eventsListeners.get('llm/adapters-updated')?.()
   const modelsUpd = await awaitMsg(phone.msgs, (m) => m.type === 'models_update' && m.sessionId === 'session-1', 'llm/adapters-updated 后广播 models_update')
   check('llm/adapters-updated 触发 models_update 广播', Array.isArray(modelsUpd.models?.groups) && modelsUpd.models.groups.length >= 1, JSON.stringify(modelsUpd.models?.groups?.map((g) => g.id)))
+
+  // 子会话继承视图：subscribe 冷子会话（session-sub）→ models_update.current = 父会话当前模型（只读继承，非 null）
+  phone.msgs.length = 0
+  phone.ws.send(JSON.stringify({ type: 'subscribe', sessionId: 'session-sub' }))
+  const subModels = await awaitMsg(phone.msgs, (m) => m.type === 'models_update' && m.sessionId === 'session-sub', '子会话 models_update')
+  check('子会话 models_update.current 继承父会话当前模型（含 set_model 切换后的模型+强度）', subModels.models?.current?.provider === 'deepseek' && subModels.models?.current?.model === 'deepseek-reasoner' && subModels.models?.current?.reasoningEffort === 'high', JSON.stringify(subModels.models?.current))
 }
 
 // ---- 技能面板：skills_update 全量下发 + skills/change 增量广播（v0.17.1：带 scope 读 preset 层全集）----
