@@ -292,6 +292,8 @@ const mockCtx = {
                   roundsStarted: 2,
                   updatedAt: 111,
                 },
+                contextPressure: { contextWindow: 128000, pressureTokens: 40000, projectedTokens: 64000 },
+                contextBreakdown: { systemTokens: 6000, toolsTokens: 10000, messageTokens: 30000 },
               },
             }
           }
@@ -685,6 +687,8 @@ check('无投影缓存元信息的冷会话：runDurationMs/totalTokens 缺省�
   const hist = await awaitMsg(phone.msgs, (m) => m.type === 'history' && m.sessionId === 'cold-1', '冷会话历史')
   check('冷会话订阅返回持久化历史', Array.isArray(hist.events) && hist.events.length === 1 && hist.events[0].type === 'user_message' && hist.events[0].text === '你好', JSON.stringify(hist.events))
   check('冷会话订阅带 goal（投影冷读）', hist.goal?.objective === '冷会话目标：重构完成' && hist.goal?.phase === 'blocked' && hist.goal?.blockedMessage === '等待用户确认' && hist.goal?.roundsStarted === 2, JSON.stringify(hist.goal))
+  const coldCtx = await awaitMsg(phone.msgs, (m) => m.type === 'context_usage' && m.sessionId === 'cold-1', '冷会话 context_usage')
+  check('冷会话订阅带 context_usage（投影缓存冷读，非空占位）', coldCtx.usage?.percent === 50 && coldCtx.usage?.contextWindow === 128000 && coldCtx.usage?.breakdown?.systemTokens === 6000, JSON.stringify(coldCtx.usage))
 }
 
 // ---- 顶层休眠会话发消息：自动打开（agents.resume）→ 消息送达 followup ----

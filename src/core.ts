@@ -563,8 +563,12 @@ export function apply(ctx: Context) {
    * percent 由服务端算好（projectedTokens / contextWindow，clamp 0-100 取整），客户端只渲染不推算（铁律 6）。
    * 无 provider 上报 usage / 无容量 → 对应字段缺省，客户端不渲染占用环。
    */
-  const contextUsageWireOf = (s: Session | undefined): ContextUsageWire => {
-    const values = s === undefined ? undefined : liveProjectionValues(s)
+  /**
+   * 从投影 values 提取上下文占用 wire（纯函数：live 投影快照与冷投影缓存共用）。
+   * percent 由服务端算好（usedTokens / contextWindow，clamp 0-100 取整），客户端只渲染不推算（铁律 6）。
+   * 无 provider 上报 usage / 无容量 → 对应字段缺省，客户端不渲染占用环。
+   */
+  const contextUsageFromValues = (values: Record<string, unknown> | undefined): ContextUsageWire => {
     const pressure = values?.['contextPressure'] as
       | { pressureTokens?: unknown; projectedTokens?: unknown; contextWindow?: unknown }
       | null | undefined
@@ -591,6 +595,9 @@ export function apply(ctx: Context) {
       ...(breakdownWire === undefined ? {} : { breakdown: breakdownWire }),
     }
   }
+
+  const contextUsageWireOf = (s: Session | undefined): ContextUsageWire =>
+    contextUsageFromValues(s === undefined ? undefined : liveProjectionValues(s))
 
   /** 每会话模型目录 wire（对齐 DSH Web session.models）：目录 + 当前选择 + routable；无 live agent / llm 服务时降级。 */
   const modelsWireOf = async (sessionId: string): Promise<SessionModelsWire> => {
@@ -2106,11 +2113,14 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
           // 冷会话目标：投影缓存冷读（零全量日志加载）；失败降级为 null（面板隐藏）
           let goal: GoalWire | null = null
           let todos: TodoWire[] = []
+          let contextUsage: ContextUsageWire = {}
           try {
             const snap = await projectionCache()?.coldSnapshot(SessionId(cmd.sessionId))
             const values = snap?.values as Record<string, unknown> | undefined
             goal = goalWireFromProjection(values?.['goal'] as GoalProjectionLike | null | undefined)
             todos = todosFromValues(values)
+            // 冷会话上下文占用：投影缓存冷读 contextPressure/contextBreakdown（子会话/顶层共用，服务端投影权威）
+            contextUsage = contextUsageFromValues(values)
           } catch (e: unknown) {
             logger.warn('GOAL', `冷会话 ${cmd.sessionId.slice(0, 12)} 目标冷读失败（降级隐藏）: ${String(e)}`)
           }
@@ -2126,10 +2136,10 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
             // 冷会话没有已挂载 agent：无命令清单（发消息本身也要求会话在桌面端打开）
             commands: [],
           })
-          // 冷会话无 live 投影：上下文占用空（客户端隐藏环）；模型目录仍可列（current=null）
+          // 冷会话：上下文占用走投影缓存冷读（子会话/顶层共用）；模型目录仍可列（current=父会话继承）
           {
             const sid = cmd.sessionId
-            send(ws, { type: 'context_usage', sessionId: sid, usage: {} })
+            send(ws, { type: 'context_usage', sessionId: sid, usage: contextUsage })
             void modelsWireOf(sid).then((models) => send(ws, { type: 'models_update', sessionId: sid, models }))
           }
         } catch (e) {
