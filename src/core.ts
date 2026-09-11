@@ -574,8 +574,10 @@ export function apply(ctx: Context) {
     const contextWindow = typeof pressure?.contextWindow === 'number' ? pressure.contextWindow : undefined
     const pressureTokens = typeof pressure?.pressureTokens === 'number' ? pressure.pressureTokens : undefined
     const projectedTokens = typeof pressure?.projectedTokens === 'number' ? pressure.projectedTokens : undefined
-    const percent = (contextWindow !== undefined && projectedTokens !== undefined && contextWindow > 0)
-      ? Math.min(100, Math.max(0, Math.round((projectedTokens / contextWindow) * 100)))
+    // 与 DSH Web contextOccupancy() 完全一致：usedTokens = projectedTokens ?? pressureTokens（预测值缺失时回退最近请求用量）
+    const usedTokens = projectedTokens ?? pressureTokens
+    const percent = (contextWindow !== undefined && usedTokens !== undefined && contextWindow > 0)
+      ? Math.min(100, Math.max(0, Math.round((usedTokens / contextWindow) * 100)))
       : undefined
     const breakdownWire = (breakdown !== null && typeof breakdown === 'object' &&
       typeof breakdown.systemTokens === 'number' && typeof breakdown.toolsTokens === 'number' && typeof breakdown.messageTokens === 'number')
