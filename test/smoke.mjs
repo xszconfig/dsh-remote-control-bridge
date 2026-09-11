@@ -36,7 +36,7 @@ const check = (label, cond, detail = '') => {
 
 // 版本兼容断言：0.15.0 起新增服务端结果交付补投递（delivery_notice + confirm_delivery + hello.pendingDeliveries）。
 // 0.16.0 起新增模型目录/上下文占用（models_update + context_usage + set_model）。
-const isVersion = (v) => v === '0.12.0' || v === '0.13.0' || v === '0.14.0' || v === '0.15.0' || v === '0.16.0' || v === '0.17.0'
+const isVersion = (v) => v === '0.12.0' || v === '0.13.0' || v === '0.14.0' || v === '0.15.0' || v === '0.16.0' || v === '0.17.0' || v === '0.17.1'
 
 // ---- mock ctx ----
 const routes = new Map()
@@ -56,6 +56,7 @@ const resumedFollowupCalls = [] // 顶层休眠会话恢复后 followup 投递�
 const subagentFollowupCalls = [] // ctx.subagents.followup 调用记录（子代理冷恢复）
 const presetMountCalls = []     // agentPresets.mount 调用记录（resume setup 挂 preset）
 const resolveCallConfigCalls = [] // set_model 命令路由：llm.resolveCallConfig 调用记录
+const skillsListCalls = [] // 技能目录：ctx.skills.list(options) 调用记录（断言带 scope 的全集读取）
 const eventsListeners = new Map()
 const inboxMessages = [
   { id: 'm1', source: { kind: 'user' }, content: [{ type: 'text', text: '排队的消息1' }] },
@@ -322,10 +323,14 @@ const mockCtx = {
     if (name === 'skills') {
       // DSH skills 服务 mock：ctx.skills.list 返回全部技能摘要（name=kebab id + description + whenToUse）
       return {
-        list: async () => [
-          { name: 'code-lint', description: '一键跑 lint 拿结构化结果' },
-          { name: 'dsh-restart', description: '重启本机 DSH 服务端', whenToUse: '用户说重启时' },
-        ],
+        list: async (options) => {
+          skillsListCalls.push(options)
+          return [
+            { name: 'code-lint', description: '一键跑 lint 拿结构化结果' },
+            { name: 'dsh-restart', description: '重启本机 DSH 服务端', whenToUse: '用户说重启时' },
+            { name: 'vision-skills', description: '把截图还原为 UI' },
+          ]
+        },
       }
     }
     if (name === 'agentDefaultModel') {
@@ -1616,12 +1621,13 @@ process.stdin.on('data', (c) => { buf = Buffer.concat([buf, c]); tryParse() })
   check('llm/adapters-updated 触发 models_update 广播', Array.isArray(modelsUpd.models?.groups) && modelsUpd.models.groups.length >= 1, JSON.stringify(modelsUpd.models?.groups?.map((g) => g.id)))
 }
 
-// ---- 技能面板：skills_update 全量下发 + skills/change 增量广播（v0.17.0）----
+// ---- 技能面板：skills_update 全量下发 + skills/change 增量广播（v0.17.1：带 scope 读 preset 层全集）----
 {
   // 新连接即下发 skills_update（随 hello/server_boot 之后）
   const phone3 = await openPhone()
   const initial = await awaitMsg(phone3.msgs, (m) => m.type === 'skills_update', '连接下发 skills_update')
-  check('连接即下发 skills_update（全部技能 name+description+whenToUse）', Array.isArray(initial.skills) && initial.skills.length === 2 && initial.skills[0].name === 'code-lint' && initial.skills[0].description === '一键跑 lint 拿结构化结果' && initial.skills[1].name === 'dsh-restart' && initial.skills[1].whenToUse === '用户说重启时', JSON.stringify(initial.skills?.map((s) => s.name)))
+  check('连接即下发 skills_update 全集（技能数 > 1，回归「只显示 1 个」）', Array.isArray(initial.skills) && initial.skills.length >= 3 && initial.skills[0].name === 'code-lint' && initial.skills[1].name === 'dsh-restart' && initial.skills[1].whenToUse === '用户说重启时', JSON.stringify(initial.skills?.map((s) => s.name)))
+  check('skills.list 带 scope（首个 live agent）读取 preset 层全集', skillsListCalls.length >= 1 && skillsListCalls[0]?.scope !== undefined, JSON.stringify(Object.keys(skillsListCalls[0] ?? {})))
   phone3.ws.close()
 
   // skills/change 失效通知 → refetch 全量广播（桌面端增删技能实时反映）
@@ -1629,7 +1635,7 @@ process.stdin.on('data', (c) => { buf = Buffer.concat([buf, c]); tryParse() })
   const sc = eventsListeners.get('skills/change')
   sc?.()
   const upd = await awaitMsg(phone.msgs, (m) => m.type === 'skills_update', 'skills/change 后广播 skills_update')
-  check('skills/change 触发 skills_update 广播', Array.isArray(upd.skills) && upd.skills.length === 2 && upd.skills.every((s) => typeof s.name === 'string' && typeof s.description === 'string'), JSON.stringify(upd.skills?.map((s) => s.name)))
+  check('skills/change 触发 skills_update 广播（全集）', Array.isArray(upd.skills) && upd.skills.length >= 3 && upd.skills.every((s) => typeof s.name === 'string' && typeof s.description === 'string'), JSON.stringify(upd.skills?.map((s) => s.name)))
 }
 
 phone.ws.close()
