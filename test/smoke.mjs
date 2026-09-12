@@ -92,6 +92,13 @@ const mockSubSession = {
   requestHeader: () => undefined,
   events: [],
 }
+// 二级子代理会话：parentSession 指向一级子代理（session-sub）；验证模型继承不区分层级、沿父链向上解析
+const mockSubSubSession = {
+  id: 'session-subsub',
+  header: { parentSession: 'session-sub', delegationDepth: 2, origin: 'subagent', cwd: '/mock', createdAt: 700 },
+  requestHeader: () => undefined,
+  events: [],
+}
 
 // 冷会话（已持久化、未加载）：list/readFrom 模拟持久化层
 const coldSessions = {
@@ -162,7 +169,7 @@ const mockCtx = {
     register(r) { routes.set(`${r.kind}:${r.path}`, r.handler) },
     registerUpgrade(r) { upgrades.set(r.path, r.handler) },
   },
-  sessions: { list: () => [mockSession, mockSubSession] },
+  sessions: { list: () => [mockSession, mockSubSession, mockSubSubSession] },
   agents: {
     list: () => [mockAgent()],
     get: (id) => (String(id) === 'session-1' ? mockAgent() : undefined),
@@ -1629,6 +1636,12 @@ process.stdin.on('data', (c) => { buf = Buffer.concat([buf, c]); tryParse() })
   phone.ws.send(JSON.stringify({ type: 'subscribe', sessionId: 'session-sub' }))
   const subModels = await awaitMsg(phone.msgs, (m) => m.type === 'models_update' && m.sessionId === 'session-sub', '子会话 models_update')
   check('子会话 models_update.current 继承父会话当前模型（含 set_model 切换后的模型+强度）', subModels.models?.current?.provider === 'deepseek' && subModels.models?.current?.model === 'deepseek-reasoner' && subModels.models?.current?.reasoningEffort === 'high', JSON.stringify(subModels.models?.current))
+
+  // 二级子会话继承视图：subscribe 冷二级子会话（session-subsub）→ 沿父链向上解析到根主会话模型（不区分层级）
+  phone.msgs.length = 0
+  phone.ws.send(JSON.stringify({ type: 'subscribe', sessionId: 'session-subsub' }))
+  const subSubModels = await awaitMsg(phone.msgs, (m) => m.type === 'models_update' && m.sessionId === 'session-subsub', '二级子会话 models_update')
+  check('二级子会话 models_update.current 沿父链向上继承根主会话模型（一级/二级统一）', subSubModels.models?.current?.provider === 'deepseek' && subSubModels.models?.current?.model === 'deepseek-reasoner' && subSubModels.models?.current?.reasoningEffort === 'high', JSON.stringify(subSubModels.models?.current))
 }
 
 // ---- 技能面板：skills_update 全量下发 + skills/change 增量广播（v0.17.1：带 scope 读 preset 层全集）----

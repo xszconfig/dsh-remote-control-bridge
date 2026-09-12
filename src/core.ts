@@ -599,15 +599,60 @@ export function apply(ctx: Context) {
   const contextUsageWireOf = (s: Session | undefined): ContextUsageWire =>
     contextUsageFromValues(s === undefined ? undefined : liveProjectionValues(s))
 
+  /**
+   * 上下文占用兜底：无 contextPressure（会话还没跑过模型，投影里没有 usage/window）时，
+   * 用「继承模型」的静态 contextWindow（resolveModelInfo 返回的容量）补 contextWindow + percent=0，
+   * 让客户端在会话加载时就展示占用环（2026-09-12 反馈：此前要客户端发消息后才出现）。
+   * 拿不到静态容量则保持原样（客户端不渲染环），不伪造数字。
+   */
+  const contextUsageWithDefault = async (sessionId: string, base: ContextUsageWire): Promise<ContextUsageWire> => {
+    if (base.percent !== undefined) return base
+    try {
+      const mw = await modelsWireOf(sessionId)
+      const cur = mw.current
+      if (cur !== null) {
+        const llmSvc = ctx.get('llm') as LlmLike | undefined
+        if (llmSvc !== undefined && typeof llmSvc.resolveModelInfo === 'function') {
+          const info = await llmSvc.resolveModelInfo(cur.provider, cur.model)
+          const cw = info?.context?.contextWindow
+          if (typeof cw === 'number' && cw > 0) {
+            return { ...base, contextWindow: cw, percent: 0 }
+          }
+        }
+      }
+    } catch (e: unknown) {
+      logger.warn('CTX', `上下文占用兜底失败 session=${sessionId.slice(0, 12)}: ${String(e)}`)
+    }
+    return base
+  }
+
+  /**
+   * 沿父链向上找最近 live 会话的 agent（子会话模型继承展示用）。
+   * 子代理统一按「直接父链」处理，不区分一级/二级：立即父冷/未挂载时继续向上（祖父→…→根主会话），
+   * 直到找到 live agent 或到根。根主会话通常 live，故任意深度的子会话都能解析到有效模型。
+   */
+  const inheritedSelectionAgentOf = async (sessionId: string): Promise<Agent | undefined> => {
+    const seen = new Set<string>()
+    let cur: string | undefined = sessionId
+    while (cur !== undefined && !seen.has(cur)) {
+      seen.add(cur)
+      const live = agentOf(cur)
+      if (live !== undefined) return live
+      const header = await sessionHeaderOf(cur)
+      cur = header?.parentSession === undefined ? undefined : String(header.parentSession)
+    }
+    return undefined
+  }
+
   /** 每会话模型目录 wire（对齐 DSH Web session.models）：目录 + 当前选择 + routable；无 live agent / llm 服务时降级。 */
   const modelsWireOf = async (sessionId: string): Promise<SessionModelsWire> => {
     const a = agentOf(sessionId)
     const llm = ctx.get('llm') as LlmLike | undefined
     // 子会话：模型入口展示「继承自父会话的当前模型」（只读，服务端投影权威，铁律 6）。
-    // DSH 子代理 inherit 父会话 route（dsh-subagent resolveChildAgentOptions 读 parent.options.provider/model）；
-    // 冷子会话无 live agent，也经 sessionHeaderOf 解析父会话。父会话无 live 时回退子会话自身（其 requestHeader 已记录继承模型）。
+    // DSH 子代理 inherit 父会话 route（dsh-subagent resolveChildAgentOptions 读 parent.options.provider/model）。
+    // 统一按直接父链向上解析（不区分一级/二级）：立即父冷/未挂载时继续向上到根主会话。
     const parentId = (await sessionHeaderOf(sessionId))?.parentSession
-    const inheritedAgent = parentId !== undefined ? agentOf(String(parentId)) : undefined
+    const inheritedAgent = parentId !== undefined ? await inheritedSelectionAgentOf(String(parentId)) : undefined
     const effectiveAgent = inheritedAgent ?? a
     const current: ModelSelectionWire | null = effectiveAgent !== undefined ? modelSelectionOf(effectiveAgent).current ?? null : null
     if (llm === undefined || typeof llm.listProviders !== 'function') {
@@ -2099,8 +2144,10 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
             // 该会话可用的斜杠命令清单（DSH commands 注册表权威；客户端 "/" 候选弹窗）
             commands: commandWireList(scope),
           })
-          // 上下文占用（同步）+ 模型目录（异步，网络目录慢不阻塞历史）+ 技能目录：随订阅下发，客户端零推算
-          send(ws, { type: 'context_usage', sessionId: String(liveSession.id), usage: contextUsageWireOf(liveSession) })
+          // 上下文占用（兜底补默认 percent=0）+ 模型目录（异步）+ 技能目录：随订阅下发，客户端零推算
+          void contextUsageWithDefault(String(liveSession.id), contextUsageWireOf(liveSession)).then((usage) =>
+            send(ws, { type: 'context_usage', sessionId: String(liveSession.id), usage }),
+          )
           void modelsWireOf(String(liveSession.id)).then((models) => send(ws, { type: 'models_update', sessionId: String(liveSession.id), models }))
           void skillsWireOf().then((skills) => send(ws, { type: 'skills_update', skills }))
           break
@@ -2136,10 +2183,12 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
             // 冷会话没有已挂载 agent：无命令清单（发消息本身也要求会话在桌面端打开）
             commands: [],
           })
-          // 冷会话：上下文占用走投影缓存冷读（子会话/顶层共用）；模型目录仍可列（current=父会话继承）
+          // 冷会话：上下文占用走投影缓存冷读（子会话/顶层共用），无数据时兜底补默认 percent=0；模型目录仍可列（current=父会话继承）
           {
             const sid = cmd.sessionId
-            send(ws, { type: 'context_usage', sessionId: sid, usage: contextUsage })
+            void contextUsageWithDefault(sid, contextUsage).then((usage) =>
+              send(ws, { type: 'context_usage', sessionId: sid, usage }),
+            )
             void modelsWireOf(sid).then((models) => send(ws, { type: 'models_update', sessionId: sid, models }))
           }
         } catch (e) {
