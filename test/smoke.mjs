@@ -36,7 +36,7 @@ const check = (label, cond, detail = '') => {
 
 // 版本兼容断言：0.15.0 起新增服务端结果交付补投递（delivery_notice + confirm_delivery + hello.pendingDeliveries）。
 // 0.16.0 起新增模型目录/上下文占用（models_update + context_usage + set_model）。
-const isVersion = (v) => v === '0.12.0' || v === '0.13.0' || v === '0.14.0' || v === '0.15.0' || v === '0.16.0' || v === '0.17.0' || v === '0.17.1'
+const isVersion = (v) => v === '0.12.0' || v === '0.13.0' || v === '0.14.0' || v === '0.15.0' || v === '0.16.0' || v === '0.17.0' || v === '0.17.1' || v === '0.17.2'
 
 // ---- mock ctx ----
 const routes = new Map()
@@ -57,6 +57,7 @@ const subagentFollowupCalls = [] // ctx.subagents.followup 调用记录（子代
 const presetMountCalls = []     // agentPresets.mount 调用记录（resume setup 挂 preset）
 const resolveCallConfigCalls = [] // set_model 命令路由：llm.resolveCallConfig 调用记录
 const skillsListCalls = [] // 技能目录：ctx.skills.list(options) 调用记录（断言带 scope 的全集读取）
+const modelSelectionOnCalls = [] // 桥挂载 model selection waterfall 监听记录（断言 prepend 抢占 apiproxy）
 const eventsListeners = new Map()
 const inboxMessages = [
   { id: 'm1', source: { kind: 'user' }, content: [{ type: 'text', text: '排队的消息1' }] },
@@ -146,7 +147,7 @@ const liveAgent = {
   id: 'session-1',
   get status() { return agentStatus },
   session: mockSession,
-  ctx: { on: () => () => {} },
+  ctx: { on: (ev, handler, options) => { modelSelectionOnCalls.push({ ev, options }); return () => {} } },
   inbox,
   steer: (m) => { inboxSteered.push(m) },
   inject: (m) => { injectCalls.push(m) },
@@ -1618,6 +1619,7 @@ process.stdin.on('data', (c) => { buf = Buffer.concat([buf, c]); tryParse() })
   const upd = await awaitMsg(phone.msgs, (m) => m.type === 'models_update' && m.sessionId === 'session-1' && m.models?.current?.model === 'deepseek-reasoner', 'set_model 后 models_update 回显新 current')
   check('set_model：resolveCallConfig 收到 provider/model/effort', resolveCallConfigCalls.length >= 1 && resolveCallConfigCalls.at(-1)?.provider === 'deepseek' && resolveCallConfigCalls.at(-1)?.model === 'deepseek-reasoner' && resolveCallConfigCalls.at(-1)?.reasoningEffort === 'high', JSON.stringify(resolveCallConfigCalls.at(-1)))
   check('set_model：models_update.current 更新为新模型', upd.models?.current?.provider === 'deepseek' && upd.models?.current?.model === 'deepseek-reasoner' && upd.models?.current?.reasoningEffort === 'high', JSON.stringify(upd.models?.current))
+  check('set_model：模型选择用 prepend 抢占 waterfall 链头（覆盖 apiproxy 先挂载的 ref，否则服务端不切换）', modelSelectionOnCalls.some((c) => c.ev === 'system-prompt/assemble' && c.options?.prepend === true) && modelSelectionOnCalls.some((c) => c.ev === 'agent/request' && c.options?.prepend === true), JSON.stringify(modelSelectionOnCalls.map((c) => ({ ev: c.ev, prepend: c.options?.prepend }))))
 
   // set_model：非法模型 → model_unavailable
   phone.msgs.length = 0

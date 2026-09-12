@@ -7,7 +7,7 @@ import type { Duplex } from 'node:stream'
 import { WebSocket, WebSocketServer } from 'ws'
 import QRCode from 'qrcode'
 import { Context } from '@deepseek-ai/cordis'
-import { installModelSelection, type Agent, type ModelSelection, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
+import { type Agent, type ModelSelection, type ModelSelectionRef } from '@deepseek-ai/dsh-agent'
 import { createUserMessage, MessageId, ReasoningEffortId, type ContentBlock } from '@deepseek-ai/dsh-llm'
 import { SessionId, type Session, type SessionEvent, type SessionHeader } from '@deepseek-ai/dsh-session'
 import type { WebRoute, WebUpgradeRoute } from '@deepseek-ai/dsh-host-webserver'
@@ -293,11 +293,34 @@ export function apply(ctx: Context) {
     selections.set(agent, ref)
     return ref
   }
-  /** 取（并首次时挂载）某 agent 的可变选择 ref：切换只在下一步 prompt 组装边界生效，不打断当前推理。 */
+  /**
+   * prepend 版 installModelSelection（逻辑与 dsh-agent 同款，仅 on(..., { prepend: true })）。
+   * 根因：apiproxy 在 Web 创建/恢复会话时先挂载其 selection ref（append，链头），
+   * waterfall 里链头最后 apply → 覆盖桥后挂载的 ref，导致手机 set_model 写桥 ref 被覆盖、服务端不切换。
+   * 桥改用 prepend 抢占链头，桥的 apply 最后执行（覆盖 apiproxy），手机切换即生效。
+   */
+  const installModelSelectionPrepend = (agentCtx: Context, selection: ModelSelectionRef): void => {
+    agentCtx.on('system-prompt/assemble', async (_assembly: any, _context: any, next: any) => {
+      const selected = selection.current
+      const assembled: any = await next()
+      selection.assembled = selected
+      if (selected === undefined) return assembled
+      return { ...assembled, variables: { ...assembled.variables, provider: selected.provider, model: selected.model } }
+    }, { prepend: true })
+    agentCtx.on('agent/request', async (_payload: any, next: any) => {
+      const resolved: any = await next()
+      const selected = selection.assembled
+      if (selected === undefined) return resolved
+      const { reasoningEffort: _inheritedEffort, ...withoutInheritedEffort } = resolved
+      return { ...withoutInheritedEffort, provider: selected.provider, model: selected.model, ...(selected.reasoningEffort === undefined ? {} : { reasoningEffort: selected.reasoningEffort }) }
+    }, { prepend: true })
+  }
+
+  /** 取（并首次时 prepend 挂载）某 agent 的可变选择 ref：切换只在下一步 prompt 组装边界生效，不打断当前推理。 */
   const installSelectionFor = (agent: Agent, scopedCtx?: Context): ModelSelectionRef => {
     const ref = modelSelectionOf(agent)
     if (!selectionInstalled.has(agent)) {
-      installModelSelection(scopedCtx ?? agent.ctx, ref)
+      installModelSelectionPrepend(scopedCtx ?? agent.ctx, ref)
       selectionInstalled.add(agent)
     }
     return ref
