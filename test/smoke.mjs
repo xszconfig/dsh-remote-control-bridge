@@ -35,8 +35,8 @@ const check = (label, cond, detail = '') => {
 }
 
 // 版本兼容断言：0.15.0 起新增服务端结果交付补投递（delivery_notice + confirm_delivery + hello.pendingDeliveries）。
-// 0.16.0 起新增模型目录/上下文占用（models_update + context_usage + set_model）；0.17.3 起新增 question-test 调试端点。
-const isVersion = (v) => v === '0.12.0' || v === '0.13.0' || v === '0.14.0' || v === '0.15.0' || v === '0.16.0' || v === '0.17.0' || v === '0.17.1' || v === '0.17.2' || v === '0.17.3'
+// 0.16.0 起新增模型目录/上下文占用（models_update + context_usage + set_model）；0.17.3 起新增 question-test 调试端点；0.17.4 起 server_boot.notes 改读版本 changelog。
+const isVersion = (v) => v === '0.12.0' || v === '0.13.0' || v === '0.14.0' || v === '0.15.0' || v === '0.16.0' || v === '0.17.0' || v === '0.17.1' || v === '0.17.2' || v === '0.17.3' || v === '0.17.4'
 
 // ---- mock ctx ----
 const routes = new Map()
@@ -1235,11 +1235,18 @@ const approvalListener = listeners.get('approval/request')
   await routes.get('exact:/remote/work')({ url: '/remote/work', method: 'PUT', headers: { host: '127.0.0.1' }, socket: { remoteAddress: '127.0.0.1' }, [Symbol.asyncIterator]: async function* () { yield JSON.stringify({ activity: null, pending: [], notes: [] }) } }, clr)
 }
 
-// ---- 重启通知：重连客户端收到 server_boot（版本 + notes）----
+// ---- 重启通知：重连客户端收到 server_boot（版本 + notes 读版本 changelog，非 work.notes）----
 {
   const phone3 = await openPhone()
   const boot = await awaitMsg(phone3.msgs, (m) => m.type === 'server_boot', 'server_boot 推送')
-  check('重连客户端收到 server_boot（版本 + notes）', isVersion(boot.version) && Array.isArray(boot.notes), JSON.stringify(boot))
+  check('重连客户端收到 server_boot（版本 + notes）', isVersion(boot.version) && Array.isArray(boot.notes) && boot.notes.length > 0, JSON.stringify(boot))
+  const { notesForVersion } = await import(new URL('../lib/changelog.js', import.meta.url).href)
+  check('server_boot.notes 来自版本 changelog（非 work.notes 陈旧台账）',
+    boot.notes.join('|') === notesForVersion(boot.version).join('|'),
+    JSON.stringify({ version: boot.version, notes: boot.notes }))
+  check('notesForVersion 精确匹配', notesForVersion('0.14.0').some((n) => n.includes('消息必达')), JSON.stringify(notesForVersion('0.14.0')))
+  check('notesForVersion patch 回退 minor', notesForVersion('0.17.4').some((n) => n.includes('技能目录')), JSON.stringify(notesForVersion('0.17.4')))
+  check('notesForVersion 无条目兜底不串版本', notesForVersion('99.0.0').join('|') === '本次更新见服务端 changelog', JSON.stringify(notesForVersion('99.0.0')))
   phone3.ws.close()
 }
 

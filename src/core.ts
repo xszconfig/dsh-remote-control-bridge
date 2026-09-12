@@ -52,6 +52,7 @@ import {
 } from './protocol.js'
 import { ConnLogger } from './logger.js'
 import { loadDeliveries, writeDeliveries, type DeliveryRecord } from './deliveries.js'
+import { notesForVersion } from './changelog.js'
 import { allowLocalOrEnvToken, bearerToken, denied, isLoopback, isLoopbackHostHeader, json } from './auth.js'
 
 // core 版本号对外暴露（ReloadController 读取 mod.BRIDGE_VERSION 作为 /remote/hot 的 coreVersion）
@@ -2547,13 +2548,13 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
     void snapshot().then((snap) => {
       send(ws, snap)
       logger.debug('WS', `已推送 hello 快照 (sessions=${snap.sessions.length})`)
-      // 重启通知：客户端重连即告知「服务端已重启 + 版本 + 新增功能」，免去客户端来问
-      const work = loadWorkState(WORK_FILE)
+      // 重启通知：客户端重连即告知「服务端已重启 + 版本 + 新增功能」，免去客户端来问。
+      // notes 读版本 changelog（不再读 work.notes——那是自动续跑活动台账，会串版本）。
       send(ws, {
         type: 'server_boot',
         version: BRIDGE_VERSION,
         bootedAt,
-        notes: work?.notes ?? [],
+        notes: notesForVersion(BRIDGE_VERSION),
       })
       // 技能目录：连接即下发全量（浏览面板数据源；变更走 skills/change 增量广播）
       void skillsWireOf().then((skills) => send(ws, { type: 'skills_update', skills }))
