@@ -2615,7 +2615,24 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
   const lanPortRaw = Number(process.env.DSH_REMOTE_LAN_PORT ?? 3081)
   const lanPort = Number.isInteger(lanPortRaw) && lanPortRaw > 0 && lanPortRaw < 65536 ? lanPortRaw : 3081
   const lanServer: ReturnType<typeof createServer> | null = lanEnabled
-    ? createServer((_req, res) => {
+    ? createServer((req, res) => {
+        const url = new URL(req.url ?? '', 'http://localhost')
+        // LAN 监听器补齐 HTTP 探测端点（与 3080 同语义）：此前只做 WS 升级，
+        // 手机把设备地址存成 3081 时 /remote/ping 返回 404 → 探测误报「离线」。
+        if (url.pathname === '/remote/ping') {
+          void listSessions()
+            .then((rows) => json(res, { ok: true, version: BRIDGE_VERSION, serverId, hostname: host, sessions: rows.length }))
+            .catch((e: unknown) => {
+              logger.warn('PING', `LAN /remote/ping 失败: ${String(e)}`)
+              json(res, { ok: false, error: 'ping failed' })
+            })
+          return
+        }
+        if (url.pathname === '/remote/hot') {
+          // 壳（index.ts）的热状态不可达，core 侧只回版本与 coreVersion，够探测用
+          json(res, { ok: true, version: BRIDGE_VERSION, coreVersion: BRIDGE_VERSION })
+          return
+        }
         res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' })
         res.end('not found')
       })

@@ -15,8 +15,10 @@ const TMP = process.env.DSH_HOME
 process.env.DSH_REMOTE_RESUME_DELAY_MS = '300'
 // 离线冒烟：关闭热重载 watcher（避免对 lib/ 挂 watcher；/remote/reload、/remote/hot 端点仍注册）
 process.env.DSH_REMOTE_HOT_RELOAD = '0'
-// 离线冒烟：关闭 LAN 二级监听（避免绑定 0.0.0.0:3081 与真实部署/并行测试冲突；ack/幂等/ping 走回环 upgrade 入口即可测）
-process.env.DSH_REMOTE_LAN = '0'
+// 离线冒烟：开启 LAN 二级监听但用随机端口（避免绑定 3081 与真实部署/并行测试冲突）；
+// 据此断言「LAN 3081 探测端点 /remote/ping、/remote/hot 返回 ok」（修复探测误报离线）。
+const LAN_TEST_PORT = 32000 + Math.floor(Math.random() * 20000)
+process.env.DSH_REMOTE_LAN_PORT = String(LAN_TEST_PORT)
 {
   const fsInit = await import('node:fs')
   const workHome = process.env.DSH_HOME ?? (process.env.HOME + '/.dsh')
@@ -36,7 +38,7 @@ const check = (label, cond, detail = '') => {
 
 // 版本兼容断言：0.15.0 起新增服务端结果交付补投递（delivery_notice + confirm_delivery + hello.pendingDeliveries）。
 // 0.16.0 起新增模型目录/上下文占用（models_update + context_usage + set_model）；0.17.3 起新增 question-test 调试端点；0.17.4 起 server_boot.notes 改读版本 changelog。
-const isVersion = (v) => v === '0.12.0' || v === '0.13.0' || v === '0.14.0' || v === '0.15.0' || v === '0.16.0' || v === '0.17.0' || v === '0.17.1' || v === '0.17.2' || v === '0.17.3' || v === '0.17.4' || v === '0.17.5'
+const isVersion = (v) => v === '0.12.0' || v === '0.13.0' || v === '0.14.0' || v === '0.15.0' || v === '0.16.0' || v === '0.17.0' || v === '0.17.1' || v === '0.17.2' || v === '0.17.3' || v === '0.17.4' || v === '0.17.5' || v === '0.17.6'
 
 // ---- mock ctx ----
 const routes = new Map()
@@ -412,6 +414,16 @@ mockCtx.webServer.port = port
 
 await apply(mockCtx)
 check('exports', name === 'dsh-remote-control-bridge' && Array.isArray(inject) && inject.includes('webServer') && inject.includes('sessionPersistence'))
+
+// ---- LAN 监听器探测端点：/remote/ping、/remote/hot 返回 ok（修复 3081 探测误报离线）----
+{
+  const pingRes = await fetch(`http://127.0.0.1:${LAN_TEST_PORT}/remote/ping`)
+  const pingJ = await pingRes.json()
+  check('LAN 3081 /remote/ping 返回 ok', pingRes.status === 200 && pingJ.ok === true && isVersion(pingJ.version) && typeof pingJ.sessions === 'number', JSON.stringify(pingJ))
+  const hotRes = await fetch(`http://127.0.0.1:${LAN_TEST_PORT}/remote/hot`)
+  const hotJ = await hotRes.json()
+  check('LAN 3081 /remote/hot 返回 ok', hotRes.status === 200 && hotJ.ok === true && isVersion(hotJ.coreVersion), JSON.stringify(hotJ))
+}
 
 // boot 立即注入：agent 已在 boot 时挂载（本例 mock 里 list() 直接返回 running agent），
 // 续跑指令应同步注入，而不是等 20s 兜底定时器（这是「重启后要等好久才续上」的延迟来源之一）。
