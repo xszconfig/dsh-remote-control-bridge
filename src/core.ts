@@ -242,7 +242,7 @@ export function apply(ctx: Context) {
   }
   /** 技能注册表软类型（ctx.skills.list：全部技能摘要，headless 部署可缺省 → 空目录）。 */
   interface SkillsLike {
-    list(options?: { cwd?: string; signal?: AbortSignal; scope?: unknown }): Promise<{ name: string; description: string; whenToUse?: string }[]>
+    list(options?: { cwd?: string; signal?: AbortSignal; scope?: unknown }): Promise<{ name: string; description: string; whenToUse?: string; invocation?: { userInvocable: boolean } }[]>
   }
   interface AgentPresetsLike {
     mount(agentCtx: unknown, presetId: string | undefined): Promise<unknown>
@@ -717,9 +717,15 @@ export function apply(ctx: Context) {
    * 全部技能目录 wire（对齐 DSH Web 技能面板：ctx.skills.list，全局层全部技能，按名排序）。
    * 无 skills 服务（headless 部署）→ 空目录。name 即 kebab-case id，DSH 无独立显示名。
    */
+  /** user-invocable 技能名缓存（send_message 斜杠路由放行技能用；skillsWireOf 刷新，避免逐条 discovery）。 */
+  let userInvocableSkillNames: Set<string> = new Set()
+
   const skillsWireOf = async (): Promise<SkillWire[]> => {
     const skills = ctx.get('skills') as SkillsLike | undefined
-    if (skills === undefined || typeof skills.list !== 'function') return []
+    if (skills === undefined || typeof skills.list !== 'function') {
+      userInvocableSkillNames = new Set()
+      return []
+    }
     try {
       // 与 Web skill.list RPC（apiproxy L2851-2872）同源：skills 注册表 host+per-scope 分层，
       // filesystem 技能（~/.agents/skills、~/.dsh/skills、project roots）挂在 agent preset 层。
@@ -730,6 +736,8 @@ export function apply(ctx: Context) {
         ...(cwd === undefined ? {} : { cwd }),
         ...(live === undefined ? {} : { scope: live }),
       })
+      // 缓存 user-invocable 技能名（dsh-tool-skill pre-step 只识别 user-invocable 技能）。
+      userInvocableSkillNames = new Set(list.filter((s) => s.invocation?.userInvocable === true).map((s) => s.name))
       return list.map((s) => ({
         name: s.name,
         description: s.description,
@@ -2310,25 +2318,30 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
               ack(false)
               break
             }
-            // 未注册命令：回会话内错误行（瞬时、不落会话日志，与 Web composer 的准入反馈一致）
-            broadcast({
-              type: 'event',
-              sessionId: cmd.sessionId,
-              event: {
-                seq: -Date.now(),
-                timestamp: Date.now(),
-                type: 'command',
-                commandStatus: 'error',
-                commandOk: false,
-                commandName: name,
-                commandArgs: line.slice(slash[0].length).trim(),
-                text: `未知命令：/${name} 未注册`,
-              },
-            })
-            logger.info('CMD', `未注册斜杠命令 name=/${name} session=${cmd.sessionId.slice(0, 12)}（回报错误行，不发模型）`)
-            // 未注册命令已被服务端「处理」（回报错误行），非网络失败——ack ok:true，客户端不重试
-            ack(true)
-            break
+            // 未注册命令：先判断是否是 user-invocable 技能（/技能名 放行 followup，
+            // 由 dsh-tool-skill 的 agent/pre-step 识别 whitespace-bounded /name token 注入 <skill_content>）。
+            // 只有「既非命令也非技能」的斜杠 token 才回报错误行（对齐 Web composer 准入反馈）。
+            if (!userInvocableSkillNames.has(name)) {
+              broadcast({
+                type: 'event',
+                sessionId: cmd.sessionId,
+                event: {
+                  seq: -Date.now(),
+                  timestamp: Date.now(),
+                  type: 'command',
+                  commandStatus: 'error',
+                  commandOk: false,
+                  commandName: name,
+                  commandArgs: line.slice(slash[0].length).trim(),
+                  text: `未知命令：/${name} 未注册`,
+                },
+              })
+              logger.info('CMD', `未注册斜杠命令 name=/${name} session=${cmd.sessionId.slice(0, 12)}（回报错误行，不发模型）`)
+              // 未注册命令已被服务端「处理」（回报错误行），非网络失败——ack ok:true，客户端不重试
+              ack(true)
+              break
+            }
+            logger.info('CMD', `斜杠 token 命中 user-invocable 技能 name=/${name} session=${cmd.sessionId.slice(0, 12)}（放行 followup，pre-step 注入）`)
           }
           a.followup(createUserMessage({ content: [{ type: 'text', text: line }], source: { kind: 'user' } }))
           ack(true)

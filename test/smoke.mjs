@@ -36,7 +36,7 @@ const check = (label, cond, detail = '') => {
 
 // 版本兼容断言：0.15.0 起新增服务端结果交付补投递（delivery_notice + confirm_delivery + hello.pendingDeliveries）。
 // 0.16.0 起新增模型目录/上下文占用（models_update + context_usage + set_model）；0.17.3 起新增 question-test 调试端点；0.17.4 起 server_boot.notes 改读版本 changelog。
-const isVersion = (v) => v === '0.12.0' || v === '0.13.0' || v === '0.14.0' || v === '0.15.0' || v === '0.16.0' || v === '0.17.0' || v === '0.17.1' || v === '0.17.2' || v === '0.17.3' || v === '0.17.4'
+const isVersion = (v) => v === '0.12.0' || v === '0.13.0' || v === '0.14.0' || v === '0.15.0' || v === '0.16.0' || v === '0.17.0' || v === '0.17.1' || v === '0.17.2' || v === '0.17.3' || v === '0.17.4' || v === '0.17.5'
 
 // ---- mock ctx ----
 const routes = new Map()
@@ -331,14 +331,14 @@ const mockCtx = {
       }
     }
     if (name === 'skills') {
-      // DSH skills 服务 mock：ctx.skills.list 返回全部技能摘要（name=kebab id + description + whenToUse）
+      // DSH skills 服务 mock：ctx.skills.list 返回全部技能摘要（name=kebab id + description + whenToUse + invocation）
       return {
         list: async (options) => {
           skillsListCalls.push(options)
           return [
-            { name: 'code-lint', description: '一键跑 lint 拿结构化结果' },
-            { name: 'dsh-restart', description: '重启本机 DSH 服务端', whenToUse: '用户说重启时' },
-            { name: 'vision-skills', description: '把截图还原为 UI' },
+            { name: 'code-lint', description: '一键跑 lint 拿结构化结果', invocation: { userInvocable: true } },
+            { name: 'dsh-restart', description: '重启本机 DSH 服务端', whenToUse: '用户说重启时', invocation: { userInvocable: true } },
+            { name: 'vision-skills', description: '把截图还原为 UI', invocation: { userInvocable: false } },
           ]
         },
       }
@@ -768,6 +768,23 @@ check('无投影缓存元信息的冷会话：runDurationMs/totalTokens 缺省�
   check('非斜杠文本原样发模型',
     followupCalls.length === before + 1 && followupCalls[followupCalls.length - 1].content?.[0]?.text === '普通文本消息',
     JSON.stringify(followupCalls[followupCalls.length - 1]?.content?.[0]?.text))
+
+  // 技能放行：/code-lint（userInvocable=true）→ 放行 followup（不报错误行），由 dsh-tool-skill pre-step 识别注入
+  phone.msgs.length = 0
+  phone.ws.send(JSON.stringify({ type: 'send_message', sessionId: 'session-1', text: '/code-lint 检查一下' }))
+  await new Promise((r) => setTimeout(r, 300))
+  const skillFollowup = followupCalls[followupCalls.length - 1]?.content?.[0]?.text
+  check('user-invocable 技能 /code-lint 放行 followup（不报未知命令）',
+    followupCalls.length === before + 2 && skillFollowup === '/code-lint 检查一下',
+    JSON.stringify(skillFollowup))
+
+  // 非 user-invocable 技能（vision-skills，userInvocable=false）→ 仍按未注册命令报错误行
+  phone.msgs.length = 0
+  phone.ws.send(JSON.stringify({ type: 'send_message', sessionId: 'session-1', text: '/vision-skills' }))
+  const skillErrRow = await awaitMsg(phone.msgs, (m) => m.type === 'event' && m.event?.type === 'command' && m.event.commandStatus === 'error' && m.event.commandName === 'vision-skills', '非 user-invocable 技能错误行')
+  check('非 user-invocable 技能 /vision-skills 仍报错误行（不放行）',
+    skillErrRow?.event?.commandName === 'vision-skills' && followupCalls.length === before + 2,
+    JSON.stringify(skillErrRow?.event?.text))
 }
 
 // ---- 消息必达（0.14.0）：ack + 幂等去重 + 应用层 ping/pong ----
