@@ -26,9 +26,6 @@ const TS_ONLY = {
   EvAgents: 'TS 历史遗留事件，core.ts 从不广播（Kotlin 未镜像）',
   PairInfo: 'REST /remote/pair-info 响应（App 只消费二维码里的 PairQrPayload）',
   DeviceRecord: 'REST /remote/devices 脱敏条目（App 不消费该端点）',
-  DeliveryNoticeWire: '服务端补投递新增：App 侧 Protocol.kt DeliveryNoticeWire 镜像在途（App 子代理负责，落地后移除此豁免）',
-  EvDeliveryNotice: '服务端补投递新增：App 侧 Protocol.kt DeliveryNotice 镜像在途（App 子代理负责，落地后移除此豁免）',
-  CmdConfirmDelivery: '服务端补投递新增：App 侧 Protocol.kt ConfirmDelivery 镜像在途（App 子代理负责，落地后移除此豁免）',
 }
 
 // Kotlin @Serializable 类在 TS protocol.ts 无对应 interface
@@ -43,6 +40,7 @@ const KT_ONLY = {
   DebugPausedWire: 'TS DebugStateWire.paused 内联匿名类型，Kotlin 具名',
   HelloLsp: 'TS EvHello.lsp 内联匿名类型，Kotlin 具名',
   HelloWork: 'TS EvHello.work 内联匿名类型，Kotlin 具名',
+  DeliveryConfirmItemWire: 'TS CmdConfirmDelivery.deliveries 内联匿名类型 {sessionId,turnKey}，Kotlin 具名',
 }
 
 // TS 接口名 → Kotlin 类名（同名不同名映射）
@@ -53,10 +51,7 @@ const NAME_MAP = {
 }
 
 // 字段级 allowlist（`<类型>.<字段>:<方向>`；方向 kt=Kotlin 缺该字段，ts=TS 缺该字段）
-// 服务端补投递新增：App 侧镜像在途（App 子代理负责，落地后移除）。
-const FIELD_ALLOWLIST = new Set([
-  'EvHello.pendingDeliveries:kt',
-])
+const FIELD_ALLOWLIST = new Set([])
 
 // ---- 解析：protocol.ts 的 interface 字段集合 ----
 

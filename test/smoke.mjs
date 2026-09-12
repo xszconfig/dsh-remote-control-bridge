@@ -35,8 +35,8 @@ const check = (label, cond, detail = '') => {
 }
 
 // 版本兼容断言：0.15.0 起新增服务端结果交付补投递（delivery_notice + confirm_delivery + hello.pendingDeliveries）。
-// 0.16.0 起新增模型目录/上下文占用（models_update + context_usage + set_model）。
-const isVersion = (v) => v === '0.12.0' || v === '0.13.0' || v === '0.14.0' || v === '0.15.0' || v === '0.16.0' || v === '0.17.0' || v === '0.17.1' || v === '0.17.2'
+// 0.16.0 起新增模型目录/上下文占用（models_update + context_usage + set_model）；0.17.3 起新增 question-test 调试端点。
+const isVersion = (v) => v === '0.12.0' || v === '0.13.0' || v === '0.14.0' || v === '0.15.0' || v === '0.16.0' || v === '0.17.0' || v === '0.17.1' || v === '0.17.2' || v === '0.17.3'
 
 // ---- mock ctx ----
 const routes = new Map()
@@ -1199,6 +1199,21 @@ const approvalListener = listeners.get('approval/request')
   check('调试端点返回 allowed-once', j.ok === true && j.outcome === 'allowed-once', JSON.stringify(j))
   check('调试端点先切 ask 策略', sessionAppendLog.some((e) => e.type === 'approval/policy' && e.data.policy === 'ask'), JSON.stringify(sessionAppendLog))
   check('approval.request 被调用', approvalRequestCalls.length === 1 && approvalRequestCalls[0].reason === '自测审批')
+}
+
+// ---- 调试端点：广播提问（question-test，点击直达弹窗链路的触发源）----
+{
+  phone.msgs.length = 0
+  const res = { status: 200, body: '', writeHead(s, h) { this.status = s }, end(b) { this.body = b.toString() } }
+  const req = { url: '/remote/debug/question-test', method: 'POST', headers: { host: '127.0.0.1' }, socket: { remoteAddress: '127.0.0.1' }, [Symbol.asyncIterator]: async function* () { yield JSON.stringify({ sessionId: 'session-1', question: '自测提问', header: '自测' }) } }
+  await routes.get('exact:/remote/debug/question-test')(req, res)
+  const j = JSON.parse(res.body)
+  check('question-test 返回 ok + rpcId + sessionId', j.ok === true && typeof j.rpcId === 'string' && j.sessionId === 'session-1', JSON.stringify(j))
+  const wire = await awaitMsg(phone.msgs, (m) => m.type === 'question_request' && m.question?.rpcId === j.rpcId, 'question-test question_request 广播')
+  check('question-test 广播 question_request（含题目/header/选项）',
+    wire.question.questions[0].question === '自测提问' && wire.question.questions[0].header === '自测'
+    && Array.isArray(wire.question.questions[0].options) && wire.question.questions[0].options.length === 2,
+    JSON.stringify(wire.question))
 }
 
 // ---- 持久化工作状态：/remote/work PUT→GET 回环 + health/hello 携带 ----

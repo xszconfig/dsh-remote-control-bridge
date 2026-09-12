@@ -2826,6 +2826,50 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
     },
   }
 
+  /** 调试端点：直接广播一个提问（question_request），供手机验证「点横幅→回前台→弹 QuestionSheet」链路。 */
+  const questionTestRoute: WebRoute = {
+    kind: 'exact',
+    path: '/remote/debug/question-test',
+    handler: async (req, res) => {
+      if (!isLoopback(req)) return denied(res)
+      if (req.method !== 'POST') {
+        json(res, { error: 'POST only' }, 405)
+        return
+      }
+      let body = ''
+      for await (const chunk of req) body += typeof chunk === 'string' ? chunk : chunk.toString()
+      let parsed: { sessionId?: string; question?: string; header?: string }
+      try {
+        parsed = JSON.parse(body) as typeof parsed
+      } catch {
+        json(res, { error: 'bad json' }, 400)
+        return
+      }
+      // 会话：优先请求里的 sessionId，否则用首个 running 会话；都没有则用标注的占位会话（不污染真实会话数据）。
+      const sessionId = String(
+        parsed.sessionId ?? allAgents().find((a) => a.status === 'running')?.id ?? 'debug-question-session',
+      )
+      const rpcId = randomUUID()
+      const wire: QuestionRequestWire = {
+        rpcId,
+        sessionId,
+        questions: [{
+          id: 'q-debug-1',
+          question: parsed.question ?? '调试测试提问：验证手机端点击直达弹窗链路',
+          header: parsed.header ?? '调试提问',
+          options: [
+            { label: '已收到', description: '确认收到调试提问（仅链路验证，不落桌面端）' },
+            { label: '忽略' },
+          ],
+        }],
+        requestedAt: Date.now(),
+      }
+      broadcast({ type: 'question_request', question: wire })
+      logger.info('DEBUG', `调试端点广播提问 rpc=${rpcId.slice(0, 8)} session=${sessionId} → ${clients.size} 客户端`)
+      json(res, { ok: true, rpcId, sessionId })
+    },
+  }
+
   /** 结构化连接日志查询（loopback only，供手机日志页 / curl 排查）。 */
   const logsRoute: WebRoute = {
     kind: 'exact',
@@ -2937,6 +2981,7 @@ const wsState = (ws: WebSocket): { alive: boolean } => {
   routeDisposers.push(ctx.webServer.register(devicesRoute))
   routeDisposers.push(ctx.webServer.register(connectedRoute))
   routeDisposers.push(ctx.webServer.register(approvalTestRoute))
+  routeDisposers.push(ctx.webServer.register(questionTestRoute))
   routeDisposers.push(ctx.webServer.register(logsRoute))
   routeDisposers.push(ctx.webServer.register(phoneLogsRoute))
   routeDisposers.push(ctx.webServer.register(debugStartRoute))
